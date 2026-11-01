@@ -1,6 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    fs::OpenOptions,
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,7 +15,7 @@ use chrono::Utc;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Child,
     sync::{mpsc, Notify},
     time::sleep,
@@ -32,6 +34,12 @@ use crate::{
 };
 
 const MAX_HISTORY: usize = 1000;
+const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LOCAL_HEADER_BYTES: usize = 16 * 1024;
+const MAX_LOCAL_BODY_BYTES: usize = 32 * 1024;
+const LOCAL_TOKEN_HEADER: &str = "x-yood-token";
+const MAX_PROCESS_LINE_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_STDERR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct DownloadManager {
@@ -44,6 +52,11 @@ pub struct DownloadManager {
     resolver: BinaryResolver,
     app_handle: Arc<Mutex<Option<AppHandle>>>,
     history_path: PathBuf,
+    notified: Arc<Mutex<HashSet<String>>>,
+    progress_port: Arc<Mutex<Option<u16>>>,
+    progress_token: Arc<Mutex<Option<String>>>,
+    progress_stop: Arc<AtomicBool>,
+    save_lock: Arc<Mutex<()>>,
 }
 
 enum RunOutcome {
@@ -60,7 +73,12 @@ impl DownloadManager {
         let history_path = directories::ProjectDirs::from("com", "PlayRood", "Yood")
             .map(|dirs| dirs.data_dir().join("downloads.json"))
             .ok_or_else(|| AppError::Configuration("could not determine data directory".into()))?;
-        let items = load_history(&history_path)?;
+        let items = load_history(&history_path).unwrap_or_else(|error| {
+            logging::warn(format!(
+                "could not load download history; starting empty: {error}"
+            ));
+            Vec::new()
+        });
         Ok(Self {
             items: Arc::new(Mutex::new(items)),
             controls: Arc::new(Mutex::new(HashMap::new())),
@@ -71,6 +89,11 @@ impl DownloadManager {
             resolver,
             app_handle: Arc::new(Mutex::new(None)),
             history_path,
+            notified: Arc::new(Mutex::new(HashSet::new())),
+            progress_port: Arc::new(Mutex::new(None)),
+            progress_token: Arc::new(Mutex::new(None)),
+            progress_stop: Arc::new(AtomicBool::new(false)),
+            save_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -78,6 +101,10 @@ impl DownloadManager {
         if let Ok(mut app) = self.app_handle.lock() {
             *app = Some(handle);
         }
+    }
+
+    pub fn wake_scheduler(&self) {
+        self.notify.notify_one();
     }
 
     pub fn list(&self) -> Vec<DownloadItem> {
@@ -94,6 +121,18 @@ impl DownloadManager {
         let url = validate_youtube_url(&request.url)?;
         request.url = url.to_string();
         validate_request(&request)?;
+        let mut items = self
+            .items
+            .lock()
+            .map_err(|_| AppError::Internal("download state lock poisoned".into()))?;
+        if let Some(request_id) = &request.request_id {
+            if let Some(existing) = items
+                .iter()
+                .find(|item| item.request.request_id.as_deref() == Some(request_id))
+            {
+                return Ok(existing.clone());
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let item = DownloadItem {
             id: id.clone(),
@@ -112,10 +151,8 @@ impl DownloadManager {
             created_at: Utc::now(),
             completed_at: None,
         };
-        self.items
-            .lock()
-            .map_err(|_| AppError::Internal("download state lock poisoned".into()))?
-            .push(item.clone());
+        items.push(item.clone());
+        drop(items);
         self.trim_and_save()?;
         // Let an already-open download manager pick up the new queue entry
         // immediately instead of only appearing once it starts downloading.
@@ -226,6 +263,7 @@ impl DownloadManager {
     }
 
     pub async fn shutdown_async(&self) {
+        self.shutdown_progress();
         if let Ok(controls) = self.controls.lock() {
             for control in controls.values() {
                 control.store(true, Ordering::SeqCst);
@@ -351,7 +389,11 @@ impl DownloadManager {
         item.status = DownloadStatus::Downloading;
         let result = item.id.clone();
         drop(items);
-        let _ = self.save();
+        if let Err(error) = self.save() {
+            logging::warn(format!(
+                "could not persist queued download {result}: {error}"
+            ));
+        }
         self.emit(result.as_str());
         Some(result)
     }
@@ -364,8 +406,9 @@ impl DownloadManager {
         let result = self.perform(&id, control).await;
         match result {
             RunOutcome::Completed(path) => {
-                logging::info(format!("download {id} completed: {}", path.display()));
+                logging::info(format!("download {id} completed"));
                 let _ = self.finish(&id, DownloadStatus::Completed, None, Some(path));
+                self.cleanup_temporary(&id);
             }
             RunOutcome::Paused => {
                 logging::info(format!("download {id} paused"));
@@ -374,10 +417,13 @@ impl DownloadManager {
             RunOutcome::Cancelled => {
                 logging::info(format!("download {id} cancelled"));
                 let _ = self.finish(&id, DownloadStatus::Cancelled, None, None);
+                self.cleanup_temporary(&id);
             }
             RunOutcome::Failed(error) => {
-                logging::error(format!("download {id} failed: {error}"));
-                let _ = self.finish(&id, DownloadStatus::Failed, Some(error.to_string()), None);
+                let public_error = safe_diagnostic(&error.to_string());
+                logging::error(format!("download {id} failed: {public_error}"));
+                let _ = self.finish(&id, DownloadStatus::Failed, Some(public_error), None);
+                self.cleanup_temporary(&id);
             }
         }
         if let Ok(mut controls) = self.controls.lock() {
@@ -412,7 +458,11 @@ impl DownloadManager {
                 return RunOutcome::Failed(AppError::Internal("settings lock poisoned".into()))
             }
         };
-        let destination = settings.download_directory.clone();
+        let destination = item
+            .request
+            .directory
+            .clone()
+            .unwrap_or_else(|| settings.download_directory.clone());
         let temporary_root = settings.temp_directory.join(id);
         if let Err(error) = ensure_safe_output_dir(&destination)
             .and_then(|_| ensure_safe_output_dir(&settings.temp_directory))
@@ -420,14 +470,21 @@ impl DownloadManager {
         {
             return RunOutcome::Failed(error);
         }
+        let destination = match fs::canonicalize(&destination) {
+            Ok(path) => path,
+            Err(error) => return RunOutcome::Failed(error.into()),
+        };
+        let temporary_root = match fs::canonicalize(&temporary_root) {
+            Ok(path) => path,
+            Err(error) => return RunOutcome::Failed(error.into()),
+        };
         if let Some(size) = metadata_size(&metadata) {
             let needed = size.saturating_add(size / 20);
             if let Some(free) = insufficient_disk_space(&destination, needed) {
                 return RunOutcome::Failed(AppError::Storage(format!(
-                    "not enough free disk space: need about {}, only {} free on {}",
+                    "not enough free disk space: need about {}, only {} free",
                     format_bytes(size),
-                    format_bytes(free),
-                    destination.display()
+                    format_bytes(free)
                 )));
             }
         }
@@ -473,18 +530,37 @@ impl DownloadManager {
                         ))
                     }
                 };
-                let extension = source.extension().and_then(|x| x.to_str()).unwrap_or("bin");
+                let extension = match source.extension().and_then(|x| x.to_str()) {
+                    Some(extension @ ("mp4" | "mkv" | "webm" | "m4a" | "mp3" | "ogg" | "opus")) => {
+                        extension
+                    }
+                    _ => "bin",
+                };
                 let stem =
                     sanitize_filename(&format!("{} - {}", channel, title), "yood-download", 180);
                 let target =
                     unique_target(&destination, &stem, extension, settings.overwrite_existing);
-                if let Err(error) = move_media(&source, &target) {
+                if let Err(error) = move_media(&source, &target, settings.overwrite_existing) {
                     return RunOutcome::Failed(error);
                 }
                 if settings.cleanup_temp_files {
                     let _ = fs::remove_dir_all(&temporary_root);
                 }
                 RunOutcome::Completed(target)
+            }
+        }
+    }
+
+    fn cleanup_temporary(&self, id: &str) {
+        let should_cleanup = self
+            .settings
+            .lock()
+            .map(|settings| settings.cleanup_temp_files)
+            .unwrap_or(true);
+        if should_cleanup {
+            if let Ok(settings) = self.settings.lock() {
+                let temporary = settings.temp_directory.join(id);
+                let _ = fs::remove_dir_all(temporary);
             }
         }
     }
@@ -601,54 +677,533 @@ impl DownloadManager {
         self.save()
     }
     fn save(&self) -> AppResult<()> {
+        let _save_guard = self
+            .save_lock
+            .lock()
+            .map_err(|_| AppError::Internal("download save lock poisoned".into()))?;
         let items = self.list();
         if let Some(parent) = self.history_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temporary = self
-            .history_path
-            .with_extension(format!("tmp.{}", std::process::id()));
-        let data = serde_json::to_vec(&items)?;
-        fs::write(&temporary, data)?;
-        fs::rename(temporary, &self.history_path)?;
-        Ok(())
+        if let Ok(metadata) = fs::symlink_metadata(&self.history_path) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(AppError::UnsafePath(
+                    "download history target is unsafe".into(),
+                ));
+            }
+        }
+        let temporary = self.history_path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let result = (|| -> AppResult<()> {
+            let data = serde_json::to_vec(&items)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            drop(file);
+            crate::settings::replace_file(&temporary, &self.history_path)?;
+            #[cfg(unix)]
+            if let Some(parent) = self.history_path.parent() {
+                if let Ok(directory) = fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
     fn emit(&self, id: &str) {
         if let Ok(item) = self.item(id) {
             self.emit_item(&item);
         }
     }
+    pub fn progress_port(&self) -> Option<u16> {
+        self.progress_port.lock().ok().and_then(|port| *port)
+    }
+
+    pub fn progress_token(&self) -> Option<String> {
+        self.progress_token
+            .lock()
+            .ok()
+            .and_then(|token| token.clone())
+    }
+
+    pub fn shutdown_progress(&self) {
+        self.progress_stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Authenticated loopback feed used by the Brave companion extension.
+    /// The listener is deliberately opt-in: WebView mode does not need this
+    /// extra network surface.
+    pub fn serve_progress(&self) -> Option<u16> {
+        let mut port_slot = self.progress_port.lock().ok()?;
+        if let Some(port) = *port_slot {
+            return Some(port);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        listener.set_nonblocking(true).ok()?;
+        let port = listener.local_addr().ok()?.port();
+        let token = Uuid::new_v4().simple().to_string();
+        *self.progress_token.lock().ok()? = Some(token.clone());
+        *port_slot = Some(port);
+        drop(port_slot);
+
+        let manager = self.clone();
+        let stop = self.progress_stop.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if connections
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                                (count < 16).then_some(count + 1)
+                            })
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let manager = manager.clone();
+                        let token = token.clone();
+                        let connections = connections.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            handle_progress_client(stream, &manager, &token);
+                            connections.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Some(port)
+    }
+
     fn emit_item(&self, item: &DownloadItem) {
         if let Ok(handle) = self.app_handle.lock() {
             if let Some(handle) = handle.as_ref() {
-                let _ = handle.emit("download-updated", item);
+                let public_item = redacted_download_item(item);
+                let _ = handle.emit("download-updated", &public_item);
+                self.notify_terminal_state(handle, item);
             }
         }
     }
 }
 
-fn load_history(path: &Path) -> AppResult<Vec<DownloadItem>> {
-    if !path.exists() {
-        return Ok(Vec::new());
+fn redacted_download_item(item: &DownloadItem) -> DownloadItem {
+    let mut public = item.clone();
+    public.output_path = None;
+    public.request.directory = None;
+    public
+}
+
+/// JSON body for the folder picker response: the chosen folder, or null.
+fn pick_folder_body(folder: Option<String>) -> String {
+    serde_json::to_string(&serde_json::json!({ "path": folder }))
+        .unwrap_or_else(|_| r#"{"path":null}"#.into())
+}
+
+#[derive(Debug, Default)]
+struct LocalRequest {
+    method: Option<String>,
+    path: Option<String>,
+    body: Option<String>,
+    token: Option<String>,
+    origin: Option<String>,
+}
+
+fn read_limited_line<R: BufRead>(reader: &mut R, limit: usize) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) if line.len() <= limit => Some(line),
+        Ok(_) | Err(_) => None,
     }
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(AppError::UnsafePath(
-            "download history is a symbolic link".into(),
+}
+
+fn read_request(stream: &std::net::TcpStream) -> Option<LocalRequest> {
+    // One buffered reader for both headers and body prevents bytes buffered
+    // past the header from being lost. Header count/size and body size are
+    // bounded before any allocation proportional to client input.
+    let mut reader = std::io::BufReader::new(stream);
+    let head = read_limited_line(&mut reader, MAX_LOCAL_HEADER_BYTES)?;
+    let mut parts = head.split_whitespace();
+    let method = parts.next()?.to_ascii_uppercase();
+    let raw_path = parts.next()?;
+    if !raw_path.starts_with('/') {
+        return None;
+    }
+    let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
+    let mut content_length = 0usize;
+    let mut saw_content_length = false;
+    let mut header_bytes = head.len();
+    let mut token = None;
+    let mut origin = None;
+    let mut terminated = false;
+    for _ in 0..64 {
+        let line = read_limited_line(&mut reader, MAX_LOCAL_HEADER_BYTES)?;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_LOCAL_HEADER_BYTES {
+            return None;
+        }
+        if line.trim().is_empty() {
+            terminated = true;
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return None;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "content-length" => {
+                if saw_content_length {
+                    return None;
+                }
+                saw_content_length = true;
+                content_length = value.parse().ok()?;
+            }
+            "transfer-encoding" => return None,
+            LOCAL_TOKEN_HEADER => {
+                if value.len() <= 256 {
+                    token = Some(value.to_string());
+                }
+            }
+            "origin" => {
+                if value.len() <= 512 {
+                    origin = Some(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if !terminated {
+        return None;
+    }
+    if content_length > MAX_LOCAL_BODY_BYTES {
+        return None;
+    }
+    let body = if content_length == 0 {
+        String::new()
+    } else {
+        let mut bytes = vec![0u8; content_length];
+        reader.read_exact(&mut bytes).ok()?;
+        String::from_utf8(bytes).ok()?
+    };
+    Some(LocalRequest {
+        method: Some(method),
+        path: Some(path),
+        body: Some(body),
+        token,
+        origin,
+    })
+}
+
+fn token_matches(expected: &str, supplied: Option<&str>) -> bool {
+    let Some(supplied) = supplied else {
+        return false;
+    };
+    if expected.len() != supplied.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(supplied.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn allowed_origin(origin: Option<&str>) -> Option<&str> {
+    let origin = origin?;
+    if origin.chars().any(char::is_control) {
+        return None;
+    }
+    if origin.starts_with("chrome-extension://")
+        || origin.starts_with("moz-extension://")
+        || origin == "https://youtube.com"
+        || origin == "https://www.youtube.com"
+        || origin == "https://m.youtube.com"
+        || origin == "https://music.youtube.com"
+        || origin == "https://youtu.be"
+        || origin == "https://youtube-nocookie.com"
+        || origin == "https://www.youtube-nocookie.com"
+    {
+        Some(origin)
+    } else {
+        None
+    }
+}
+
+fn public_download_item(item: &DownloadItem) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "title": item.title,
+        "channel": item.channel,
+        "thumbnail": item.thumbnail,
+        "status": item.status,
+        "progress": item.progress,
+        "speed": item.speed,
+        "eta": item.eta,
+        "error": item.error,
+        "created_at": item.created_at,
+        "completed_at": item.completed_at,
+    })
+}
+
+fn handle_progress_client(
+    mut stream: std::net::TcpStream,
+    manager: &DownloadManager,
+    expected_token: &str,
+) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let Some(request) = read_request(&stream) else {
+        let body = r#"{"ok":false,"error":"invalid request"}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        return;
+    };
+    let authorized = request.method.as_deref() == Some("OPTIONS")
+        || token_matches(expected_token, request.token.as_deref());
+    let (status, body) = if !authorized {
+        (
+            "403 Forbidden",
+            r#"{"ok":false,"error":"unauthorized"}"#.to_string(),
+        )
+    } else if request.method.as_deref() == Some("OPTIONS") {
+        ("200 OK", String::new())
+    } else if request.method.as_deref() == Some("GET")
+        && request.path.as_deref() == Some("/downloads")
+    {
+        let items = manager
+            .list()
+            .iter()
+            .map(public_download_item)
+            .collect::<Vec<_>>();
+        match serde_json::to_string(&serde_json::json!({ "items": items })) {
+            Ok(body) => ("200 OK", body),
+            Err(_) => ("500 Internal Server Error", r#"{"ok":false}"#.into()),
+        }
+    } else if request.method.as_deref() == Some("GET")
+        && request.path.as_deref() == Some("/defaults")
+    {
+        let directory = manager
+            .settings
+            .lock()
+            .ok()
+            .map(|settings| settings.download_directory.to_string_lossy().into_owned());
+        match serde_json::to_string(&serde_json::json!({
+            "download_directory": directory,
+            "progress_port": manager.progress_port(),
+        })) {
+            Ok(body) => ("200 OK", body),
+            Err(_) => ("500 Internal Server Error", r#"{"ok":false}"#.into()),
+        }
+    } else if request.method.as_deref() == Some("POST")
+        && request.path.as_deref() == Some("/enqueue")
+    {
+        let outcome = match request
+            .body
+            .as_deref()
+            .map(serde_json::from_str::<crate::models::DownloadRequest>)
+        {
+            Some(Ok(mut download)) => {
+                if download.context.as_deref().unwrap_or("").is_empty() {
+                    download.context = Some("extension".into());
+                }
+                match manager.enqueue(download) {
+                    Ok(item) => (
+                        "200 OK",
+                        serde_json::json!({ "ok": true, "id": item.id }).to_string(),
+                    ),
+                    Err(error) => (
+                        "200 OK",
+                        serde_json::json!({
+                            "ok": false,
+                            "error": error.to_string().chars().take(512).collect::<String>(),
+                        })
+                        .to_string(),
+                    ),
+                }
+            }
+            _ => (
+                "400 Bad Request",
+                r#"{"ok":false,"error":"invalid request"}"#.into(),
+            ),
+        };
+        outcome
+    } else if request.method.as_deref() == Some("POST")
+        && request.path.as_deref() == Some("/pick-folder")
+    {
+        logging::info("folder picker requested from extension");
+        let folder = manager
+            .app_handle
+            .lock()
+            .ok()
+            .and_then(|handle| handle.clone())
+            .and_then(|handle| {
+                use tauri_plugin_dialog::DialogExt;
+                handle
+                    .dialog()
+                    .file()
+                    .blocking_pick_folder()
+                    .and_then(|path| path.into_path().ok())
+                    .and_then(|path| {
+                        crate::security::ensure_safe_output_dir(&path)
+                            .ok()
+                            .map(|_| path.to_string_lossy().into_owned())
+                    })
+            });
+        ("200 OK", pick_folder_body(folder))
+    } else {
+        (
+            "404 Not Found",
+            r#"{"ok":false,"error":"not found"}"#.into(),
+        )
+    };
+    let cors_origin = allowed_origin(request.origin.as_deref());
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: X-Yood-Token, Content-Type\r\nAccess-Control-Max-Age: 600\r\nVary: Origin\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(origin) = cors_origin {
+        response.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+    }
+    response.push_str("\r\n");
+    response.push_str(&body);
+    let _ = stream.write_all(response.as_bytes());
+}
+
+impl DownloadManager {
+    /// One OS notification per download when it reaches a terminal state
+    /// (completed / failed). Guarded by id so progress re-emits never
+    /// double-notify; failures surface the backend error, successes the
+    /// saved file name.
+    fn notify_terminal_state(&self, handle: &AppHandle, item: &DownloadItem) {
+        let terminal = matches!(
+            item.status,
+            DownloadStatus::Completed | DownloadStatus::Failed
+        );
+        if !terminal {
+            return;
+        }
+        let fresh = self
+            .notified
+            .lock()
+            .map(|mut seen| seen.insert(item.id.clone()))
+            .unwrap_or(false);
+        if !fresh {
+            return;
+        }
+        let title: String = item.title.chars().take(120).collect();
+        let body = match &item.status {
+            DownloadStatus::Completed => {
+                let saved = item
+                    .output_path
+                    .as_ref()
+                    .and_then(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_else(|| "download complete".into());
+                format!("Download complete: {saved}")
+            }
+            _ => {
+                let reason = item.error.as_deref().unwrap_or("unknown error");
+                let reason: String = reason.chars().take(120).collect();
+                format!("Download failed: {title} — {reason}")
+            }
+        };
+        {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = handle
+                .notification()
+                .builder()
+                .title("Yood")
+                .body(body)
+                .show();
+        }
+    }
+}
+
+fn load_history(path: &Path) -> AppResult<Vec<DownloadItem>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_HISTORY_BYTES
+    {
+        return Err(AppError::Storage(
+            "download history is not a bounded regular file".into(),
         ));
     }
-    let mut items: Vec<DownloadItem> = serde_json::from_slice(&fs::read(path)?)?;
-    for item in &mut items {
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 > MAX_HISTORY_BYTES {
+        return Err(AppError::Storage(
+            "download history exceeds the size limit".into(),
+        ));
+    }
+    let mut items: Vec<DownloadItem> = serde_json::from_slice(&bytes)?;
+    items.retain_mut(|item| {
+        if Uuid::parse_str(&item.id).is_err()
+            || item.title.len() > 2048
+            || item.channel.len() > 1024
+            || item.error.as_ref().is_some_and(|error| error.len() > 4096)
+            || item
+                .thumbnail
+                .as_ref()
+                .is_some_and(|thumbnail| thumbnail.len() > 4096)
+            || validate_youtube_url(&item.request.url).is_err()
+            || validate_request_fields(&item.request).is_err()
+        {
+            return false;
+        }
         if matches!(item.status, DownloadStatus::Downloading) {
             item.status = DownloadStatus::Interrupted;
             item.error = Some("Yood closed while this download was active".into());
         }
-    }
+        if let Some(path) = &item.output_path {
+            if fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+                .unwrap_or(false)
+            {
+                item.output_path = None;
+            }
+        }
+        true
+    });
     items.truncate(MAX_HISTORY);
     Ok(items)
 }
 
-fn validate_request(request: &DownloadRequest) -> AppResult<()> {
-    if request.quality.len() > 32 || request.container != "mp4" && request.container != "mkv" {
+fn validate_request_fields(request: &DownloadRequest) -> AppResult<()> {
+    if !matches!(
+        request.quality.as_str(),
+        "best" | "1080" | "720" | "480" | "worst"
+    ) || !matches!(request.container.as_str(), "mp4" | "mkv")
+    {
         return Err(AppError::InvalidInput(
             "unsupported download quality or container".into(),
         ));
@@ -660,6 +1215,14 @@ fn validate_request(request: &DownloadRequest) -> AppResult<()> {
             ));
         }
     }
+    if let Some(audio_quality) = &request.audio_quality {
+        if audio_quality.is_empty()
+            || audio_quality.len() > 3
+            || !audio_quality.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(AppError::InvalidInput("invalid audio quality".into()));
+        }
+    }
     if let Some(context) = &request.context {
         if context.len() > 32 || context.chars().any(|c| c.is_control()) {
             return Err(AppError::InvalidInput("invalid download context".into()));
@@ -669,6 +1232,36 @@ fn validate_request(request: &DownloadRequest) -> AppResult<()> {
         if !is_valid_subtitle_language(language) {
             return Err(AppError::InvalidInput("invalid subtitle language".into()));
         }
+    }
+    if let Some(request_id) = &request.request_id {
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(AppError::InvalidInput("invalid download request id".into()));
+        }
+    }
+    if let Some(directory) = &request.directory {
+        if !directory.is_absolute()
+            || directory.file_name().is_none()
+            || directory
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(AppError::UnsafePath(
+                "download directory must be an absolute path".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_request(request: &DownloadRequest) -> AppResult<()> {
+    validate_request_fields(request)?;
+    if let Some(directory) = &request.directory {
+        ensure_safe_output_dir(directory)?;
     }
     Ok(())
 }
@@ -763,39 +1356,73 @@ async fn run_download_process(
     let mut child: Child = command
         .spawn()
         .map_err(|error| AppError::Process(error.to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Process("yt-dlp stdout unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::Process("yt-dlp stderr unavailable".into()))?;
-    let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(AppError::Process("yt-dlp stdout unavailable".into()));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(AppError::Process("yt-dlp stderr unavailable".into()));
+    };
+    let (sender, mut receiver) = mpsc::channel::<String>(256);
     let stdout_task = tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if sender.send(line).is_err() {
+            if line.len() > MAX_PROCESS_LINE_BYTES {
+                continue;
+            }
+            if sender.send(line).await.is_err() {
                 break;
             }
         }
     });
     let stderr_task = tauri::async_runtime::spawn(async move {
         let mut reader = BufReader::new(stderr);
-        let mut text = String::new();
-        let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut text).await;
-        text
+        let mut retained = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            if retained.len() < MAX_PROCESS_STDERR_BYTES {
+                let remaining = MAX_PROCESS_STDERR_BYTES - retained.len();
+                retained.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+        String::from_utf8_lossy(&retained).into_owned()
     });
     let mut last_error = String::new();
     let status = loop {
         tokio::select! {
             line = receiver.recv() => if let Some(line) = line { if let Some((progress, speed, eta, bytes)) = parse_progress(&line) { manager.update_progress(&id, progress, speed, eta, bytes); } else if !line.is_empty() { last_error = line; } },
-            result = child.wait() => break result.map_err(|error| AppError::Process(error.to_string()))?,
+            result = child.wait() => {
+                match result {
+                    Ok(status) => break status,
+                    Err(error) => {
+                        receiver.close();
+                        let _ = process::terminate(&mut child).await;
+                        let _ = stdout_task.await;
+                        let _ = stderr_task.await;
+                        return Err(AppError::Process(error.to_string()));
+                    }
+                }
+            },
             _ = sleep(Duration::from_millis(250)) => {
-                if control.load(Ordering::SeqCst) { process::terminate(&mut child).await; let _ = stdout_task.await; let _ = stderr_task.await; let item = manager.item(&id).ok(); return Ok(if item.is_some_and(|item| matches!(item.status, DownloadStatus::Paused)) { ProcessResult::Paused } else { ProcessResult::Cancelled }); }
+                if control.load(Ordering::SeqCst) {
+                    process::terminate(&mut child).await;
+                    receiver.close();
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    let item = manager.item(&id).ok();
+                    return Ok(if item.is_some_and(|item| matches!(item.status, DownloadStatus::Paused)) { ProcessResult::Paused } else { ProcessResult::Cancelled });
+                }
             }
         }
     };
+    receiver.close();
     let _ = stdout_task.await;
     let stderr_text = stderr_task
         .await
@@ -848,14 +1475,40 @@ fn parse_player_source(stdout: &str) -> AppResult<String> {
         .find(|line| line.starts_with("https://"))
         .ok_or_else(|| AppError::Process("yt-dlp returned no playable media URL".into()))?;
     if source.len() > 16 * 1024 || source.chars().any(char::is_control) {
-        return Err(AppError::Process("yt-dlp returned an invalid media URL".into()));
+        return Err(AppError::Process(
+            "yt-dlp returned an invalid media URL".into(),
+        ));
     }
     let parsed = url::Url::parse(source)
         .map_err(|_| AppError::Process("yt-dlp returned an invalid media URL".into()))?;
-    if parsed.scheme() != "https" || parsed.host_str().is_none() {
-        return Err(AppError::Process("yt-dlp returned an unsafe media URL".into()));
+    let Some(host) = parsed.host_str() else {
+        return Err(AppError::Process(
+            "yt-dlp returned an unsafe media URL".into(),
+        ));
+    };
+    let host = host.to_ascii_lowercase();
+    let allowed_host = host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "googlevideo.com"
+        || host.ends_with(".googlevideo.com");
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !allowed_host
+    {
+        return Err(AppError::Process(
+            "yt-dlp returned an unsafe media URL".into(),
+        ));
     }
     Ok(parsed.into())
+}
+
+fn bounded_metadata(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect()
 }
 
 fn parse_inspect(stdout: &str) -> AppResult<InspectResult> {
@@ -867,21 +1520,23 @@ fn parse_inspect(stdout: &str) -> AppResult<InspectResult> {
     let title = value
         .get("title")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(|value| bounded_metadata(value, 512));
     let channel = value
         .get("uploader")
         .or_else(|| value.get("channel"))
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(|value| bounded_metadata(value, 256));
     let duration = value
         .get("duration_string")
         .or_else(|| value.get("duration"))
         .map(|value| value.to_string())
-        .filter(|value| value != "null");
+        .filter(|value| value != "null")
+        .map(|value| bounded_metadata(&value, 128));
     let thumbnail = value
         .get("thumbnail")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .filter(|url| url.starts_with("https://"))
+        .map(|url| bounded_metadata(url, 2048));
     let size_bytes = value
         .get("filesize")
         .and_then(Value::as_u64)
@@ -906,40 +1561,47 @@ fn parse_inspect(stdout: &str) -> AppResult<InspectResult> {
 
 fn parse_entry(value: &Value) -> Option<VideoEntry> {
     let id = value.get("id")?.as_str()?.to_string();
-    if id.is_empty() {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
         return None;
     }
     let url = value
         .get("webpage_url")
         .or_else(|| value.get("url"))
         .and_then(Value::as_str)
-        .filter(|url| url.starts_with("http"))
-        .map(str::to_string)
+        .and_then(|url| validate_youtube_url(url).ok())
+        .map(|url| url.into())
         .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
-    let title = value
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Untitled video")
-        .chars()
-        .take(512)
-        .collect();
-    let channel = value
-        .get("uploader")
-        .or_else(|| value.get("channel"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .chars()
-        .take(256)
-        .collect();
+    let title = bounded_metadata(
+        value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled video"),
+        512,
+    );
+    let channel = bounded_metadata(
+        value
+            .get("uploader")
+            .or_else(|| value.get("channel"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        256,
+    );
     let duration = value
         .get("duration_string")
         .or_else(|| value.get("duration"))
         .map(|value| value.to_string())
-        .filter(|value| value != "null");
+        .filter(|value| value != "null")
+        .map(|value| bounded_metadata(&value, 128));
     let thumbnail = value
         .get("thumbnail")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .filter(|url| url.starts_with("https://"))
+        .map(|url| bounded_metadata(url, 2048));
     Some(VideoEntry {
         id,
         url,
@@ -1008,6 +1670,14 @@ fn locate_media(directory: &Path) -> Option<PathBuf> {
             Some((meta.len(), path))
         })
         .collect::<Vec<_>>();
+    let exact = candidates.iter().filter(|(_, path)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("yood-source.") && !name.contains(".f"))
+    });
+    if let Some((_, path)) = exact.max_by_key(|(size, _)| *size) {
+        return Some(path.clone());
+    }
     candidates.sort_by_key(|(size, _)| *size);
     candidates.pop().map(|(_, path)| path)
 }
@@ -1026,25 +1696,64 @@ fn unique_target(directory: &Path, stem: &str, extension: &str, overwrite: bool)
     directory.join(format!("{stem}-{}.{extension}", Uuid::new_v4()))
 }
 
-fn move_media(source: &Path, target: &Path) -> AppResult<()> {
-    if target.exists() && fs::symlink_metadata(target)?.file_type().is_symlink() {
-        return Err(AppError::UnsafePath("target is a symbolic link".into()));
+fn move_media(source: &Path, target: &Path, overwrite: bool) -> AppResult<()> {
+    if target.exists() {
+        let metadata = fs::symlink_metadata(target)?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::UnsafePath("target is a symbolic link".into()));
+        }
+        if !overwrite {
+            return Err(AppError::Storage("target already exists".into()));
+        }
+        fs::remove_file(target)?;
     }
-    fs::rename(source, target)
-        .or_else(|_| {
-            fs::copy(source, target)
-                .map(|_| ())
-                .and_then(|_| fs::remove_file(source))
-        })
-        .map_err(|error| AppError::Storage(format!("cannot move completed download: {error}")))
+    if !overwrite {
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .map_err(|error| {
+                AppError::Storage(format!("cannot reserve completed download: {error}"))
+            })?;
+        let mut input = fs::File::open(source)?;
+        let copied = std::io::copy(&mut input, &mut destination);
+        let synced = destination.sync_all();
+        drop(destination);
+        if copied.is_err() || synced.is_err() {
+            let _ = fs::remove_file(target);
+            return Err(AppError::Storage("cannot copy completed download".into()));
+        }
+        fs::remove_file(source)?;
+        return Ok(());
+    }
+    if fs::rename(source, target).is_err() {
+        let copy_result = (|| -> AppResult<()> {
+            let mut input = fs::File::open(source)?;
+            let mut destination = OpenOptions::new().write(true).truncate(true).open(target)?;
+            std::io::copy(&mut input, &mut destination)?;
+            destination.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(target);
+            return Err(error);
+        }
+        fs::remove_file(source)?;
+    }
+    Ok(())
 }
 
 fn safe_diagnostic(value: &str) -> String {
     value
         .split_whitespace()
         .map(|part| {
-            if part.starts_with("http://") || part.starts_with("https://") {
-                "[URL redacted]"
+            if part.starts_with("http://")
+                || part.starts_with("https://")
+                || part.starts_with("file://")
+                || part.starts_with('/')
+                || part.contains('\\')
+            {
+                "[detail redacted]"
             } else {
                 part
             }
@@ -1083,8 +1792,12 @@ mod tests {
 
     #[test]
     fn accepts_only_https_player_sources() {
-        assert!(parse_player_source("https://rr1---sn.example.test/media.mp4\n").is_ok());
-        assert!(parse_player_source("http://example.test/media.mp4\n").is_err());
+        assert!(parse_player_source("https://rr1---sn.googlevideo.com/media.mp4\n").is_ok());
+        assert!(parse_player_source("http://rr1---sn.googlevideo.com/media.mp4\n").is_err());
+        assert!(
+            parse_player_source("https://user:pass@rr1---sn.googlevideo.com/media.mp4\n").is_err()
+        );
+        assert!(parse_player_source("https://localhost/media.mp4\n").is_err());
         assert!(parse_player_source("not a URL\n").is_err());
     }
 
@@ -1181,5 +1894,43 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&control_selector).is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_server_tests {
+    use super::{allowed_origin, pick_folder_body, token_matches};
+
+    #[test]
+    fn local_feed_requires_a_matching_token_and_only_echoes_known_origins() {
+        assert!(token_matches("0123456789abcdef", Some("0123456789abcdef")));
+        assert!(!token_matches("0123456789abcdef", Some("0123456789abcdeg")));
+        assert!(!token_matches("0123456789abcdef", None));
+        assert_eq!(
+            allowed_origin(Some("https://www.youtube.com")),
+            Some("https://www.youtube.com")
+        );
+        assert_eq!(allowed_origin(Some("https://evil.example")), None);
+    }
+
+    #[test]
+    fn encodes_chosen_folder_or_explicit_null() {
+        assert_eq!(
+            pick_folder_body(Some("/home/user/Videos".into())),
+            r#"{"path":"/home/user/Videos"}"#
+        );
+        assert_eq!(pick_folder_body(None), r#"{"path":null}"#);
+    }
+
+    #[test]
+    fn parses_extension_enqueue_payload() {
+        let request: crate::models::DownloadRequest = serde_json::from_str(
+            r#"{"url":"https://www.youtube.com/watch?v=abc","mode":"audio","subtitle_language":"he","directory":"/tmp/x","context":"extension"}"#,
+        )
+        .expect("enqueue payload parses");
+        assert_eq!(request.url, "https://www.youtube.com/watch?v=abc");
+        assert!(matches!(request.mode, crate::models::DownloadMode::Audio));
+        assert_eq!(request.subtitle_language.as_deref(), Some("he"));
+        assert_eq!(request.context.as_deref(), Some("extension"));
     }
 }

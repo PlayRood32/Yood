@@ -38,9 +38,7 @@ pub fn detect() -> DesktopEnvironment {
     .join(":")
     .to_ascii_lowercase();
 
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
-        || desktop.contains("hyprland")
-    {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() || desktop.contains("hyprland") {
         DesktopEnvironment::Hyprland
     } else if std::env::var_os("NIRI_SOCKET").is_some() || desktop.contains("niri") {
         DesktopEnvironment::Niri

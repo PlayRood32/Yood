@@ -1,13 +1,26 @@
 {
   "manifest_version": 3,
   "name": "Yood Downloads",
-  "version": "1.0.0",
+  "version": "1.0.5",
+  "icons": {
+    "48": "app-icon.png",
+    "128": "app-icon.png"
+  },
   "description": "Adds Yood download buttons to YouTube (including Shorts) and blocks YouTube ad requests. Clicking Download hands the video to the Yood desktop app.",
-  "permissions": ["declarativeNetRequest"],
-  "host_permissions": [
-    "https://*.youtube.com/*",
-    "https://youtu.be/*"
+  "permissions": [
+    "declarativeNetRequest"
   ],
+  "host_permissions": [
+    "https://youtube.com/*",
+    "https://*.youtube.com/*",
+    "https://youtu.be/*",
+    "https://youtube-nocookie.com/*",
+    "https://*.youtube-nocookie.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "declarative_net_request": {
     "rule_resources": [
       {
@@ -17,14 +30,55 @@
       }
     ]
   },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "app-icon.png"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
+    }
+  ],
   "content_scripts": [
     {
       "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "app-shell.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://youtube.com/*",
         "https://*.youtube.com/*",
         "https://youtu.be/*",
+        "https://youtube-nocookie.com/*",
         "https://*.youtube-nocookie.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "page.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://youtube.com/*",
+        "https://*.youtube.com/*",
+        "https://youtu.be/*",
+        "https://youtube-nocookie.com/*",
+        "https://*.youtube-nocookie.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start",
       "all_frames": false
     }

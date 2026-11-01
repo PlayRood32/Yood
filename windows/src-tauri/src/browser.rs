@@ -2,27 +2,59 @@
 //! and then runs headless (downloads, deep links, single instance) with no
 //! WebKit window at all. No extra dev command needed for end users.
 //!
-//! The legacy embedded WebKit view is kept behind `YOOD_WEBVIEW=1` for
-//! debugging only: it segfaults on YouTube's full player pages on affected
-//! systems (upstream WebKitGTK bug, proven by bisection).
-//!
-//! This is the only launch path now (the dev-only bash helper was removed).
+//! Windows prefers installed or bundled Brave; the Tauri WebView is the
+//! fallback when Brave is unavailable. Set `YOOD_ENGINE=webview` to force it.
 
 use std::{
-    path::PathBuf,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     time::Duration,
 };
 
-use crate::{
-    commands::RuntimeState, logging, models::DownloadStatus, startup_url,
-};
+use uuid::Uuid;
+
+use crate::{commands::RuntimeState, logging, models::DownloadStatus, startup_url};
 
 static BRAVE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
+fn legacy_webview_requested() -> bool {
+    std::env::var_os("YOOD_WEBVIEW")
+        .map(|value| {
+            !matches!(
+                value.to_string_lossy().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn is_webview_mode() -> bool {
-    std::env::var_os("YOOD_WEBVIEW").is_some()
+    let default_webview = || {
+        #[cfg(windows)]
+        let brave_available = bundled_or_system_brave().is_some();
+        #[cfg(not(windows))]
+        let brave_available = true;
+        default_webview_mode(brave_available, legacy_webview_requested())
+    };
+    match std::env::var("YOOD_ENGINE") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "webview" | "webkit" => true,
+            "brave" => false,
+            "auto" | "" => default_webview(),
+            other => {
+                logging::warn(format!("unknown YOOD_ENGINE={other:?}; using Brave"));
+                false
+            }
+        },
+        Err(_) => default_webview(),
+    }
+}
+
+fn default_webview_mode(brave_available: bool, webview_requested: bool) -> bool {
+    webview_requested || (cfg!(windows) && !brave_available)
 }
 
 #[cfg(windows)]
@@ -38,15 +70,17 @@ fn brave_exe_name() -> &'static str {
 fn is_executable(path: &PathBuf) -> bool {
     #[cfg(windows)]
     {
-        path.is_file()
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
-        path.is_file()
-            && std::fs::metadata(path)
-                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
 }
 
@@ -104,10 +138,7 @@ fn bundled_or_system_brave() -> Option<PathBuf> {
     // Prefer the real binary over distro wrapper scripts (e.g. Arch's
     // /usr/bin/brave, which injects --password-store and user flag files).
     #[cfg(not(windows))]
-    for candidate in [
-        "/opt/brave-bin/brave",
-        "/opt/brave.com/brave/brave",
-    ] {
+    for candidate in ["/opt/brave-bin/brave", "/opt/brave.com/brave/brave"] {
         let candidate = PathBuf::from(candidate);
         if let Some(hit) = consider(candidate) {
             return Some(hit);
@@ -130,18 +161,24 @@ fn bundled_or_system_brave() -> Option<PathBuf> {
         return Some(hit);
     }
     logging::warn(format!(
-        "no Brave binary found; searched: {}",
-        tried
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "no Brave binary found after checking {} candidates",
+        tried.len()
     ));
     None
 }
 
 fn extension_dir() -> Option<PathBuf> {
-    // Installed layout first: `yood` next to `extension/yood`.
+    // The per-user copy first: Brave compiles the extension's
+    // declarativeNetRequest rules into a `_metadata` directory NEXT TO the
+    // extension, so the loaded directory must be user-writable. System
+    // locations like Program Files are read-only and fail the whole
+    // extension load with "rules.json: Internal error while parsing rules"
+    // (no download buttons, no Alt+L). The embedded copy is version-locked
+    // to this binary and (over)written on every launch, so it is never stale.
+    if let Some(dir) = materialize_embedded_extension() {
+        return Some(dir);
+    }
+    // Installed layout fallback: `yood` next to `extension/yood`.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             // Some installers nest bundled resources under resources/.
@@ -168,10 +205,7 @@ fn extension_dir() -> Option<PathBuf> {
             }
         }
     }
-    // Last resort: the extension is embedded in this binary (always
-    // version-locked to it). Materialize it under the app data dir so ANY
-    // install layout — NSIS, portable, dev — loads the current version.
-    materialize_embedded_extension()
+    None
 }
 
 /// The companion extension, compiled into the binary so it can never go
@@ -179,29 +213,128 @@ fn extension_dir() -> Option<PathBuf> {
 /// unavailable" on careless installs).
 const EXTENSION_MANIFEST: &str = include_str!("../../../shared/extension/yood/manifest.json");
 const EXTENSION_CONTENT_JS: &str = include_str!("../../../shared/extension/yood/content.js");
+const EXTENSION_APP_SHELL_JS: &str = include_str!("../../../shared/extension/yood/app-shell.js");
+const EXTENSION_APP_ICON: &[u8] = include_bytes!("../../../shared/extension/yood/app-icon.png");
+const EXTENSION_PAGE_JS: &str = include_str!("../../../shared/extension/yood/page.js");
+const EXTENSION_BACKGROUND_JS: &str = include_str!("../../../shared/extension/yood/background.js");
 const EXTENSION_RULES_JSON: &str = include_str!("../../../shared/extension/yood/rules.json");
+
+fn write_materialized_file(path: &Path, contents: &str) -> bool {
+    write_materialized_bytes(path, contents.as_bytes())
+}
+
+fn write_materialized_bytes(path: &Path, contents: &[u8]) -> bool {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let temporary = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("extension staging create failed: {error}"))?;
+        file.write_all(contents)
+            .map_err(|error| format!("extension staging write failed: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("extension staging sync failed: {error}"))?;
+        drop(file);
+        crate::settings::replace_file(&temporary, path)
+            .map_err(|error| format!("extension activation failed: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.is_ok()
+}
 
 fn materialize_embedded_extension() -> Option<PathBuf> {
     let project = directories::ProjectDirs::from("com", "PlayRood", "Yood")?;
     let dir = project.data_dir().join("yood-extension");
-    if std::fs::create_dir_all(&dir).is_err() {
+    if let Ok(metadata) = fs::symlink_metadata(&dir) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return None;
+        }
+    }
+    if fs::create_dir_all(&dir).is_err() {
         return None;
     }
-    // Always (over)write: guarantees the loaded extension matches this
-    // binary after updates. Files are tiny; Brave reads them at startup.
-    if std::fs::write(dir.join("manifest.json"), EXTENSION_MANIFEST).is_err() {
-        return None;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
-    if std::fs::write(dir.join("content.js"), EXTENSION_CONTENT_JS).is_err() {
-        return None;
+    let metadata_cache = dir.join("_metadata");
+    match fs::symlink_metadata(&metadata_cache) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let _ = fs::remove_file(&metadata_cache);
+        }
+        Ok(_) => {
+            let _ = fs::remove_dir_all(&metadata_cache);
+        }
+        Err(_) => {}
     }
-    // declarativeNetRequest rule set referenced by manifest.json. Older
-    // materialized copies predate it; writing unconditionally also heals
-    // those installs.
-    if std::fs::write(dir.join("rules.json"), EXTENSION_RULES_JSON).is_err() {
+    if !write_materialized_file(&dir.join("manifest.json"), EXTENSION_MANIFEST)
+        || !write_materialized_file(&dir.join("content.js"), EXTENSION_CONTENT_JS)
+        || !write_materialized_file(&dir.join("app-shell.js"), EXTENSION_APP_SHELL_JS)
+        || !write_materialized_bytes(&dir.join("app-icon.png"), EXTENSION_APP_ICON)
+        || !write_materialized_file(&dir.join("page.js"), EXTENSION_PAGE_JS)
+        || !write_materialized_file(&dir.join("background.js"), EXTENSION_BACKGROUND_JS)
+        || !write_materialized_file(&dir.join("rules.json"), EXTENSION_RULES_JSON)
+    {
+        let _ = fs::remove_dir_all(&dir);
         return None;
     }
     Some(dir)
+}
+
+/// Companion to the materialized extension: the current default download
+/// folder plus the localhost progress-server port, so the extension's
+/// download dialog can show the full default path in "Save to" and its
+/// downloads side panel can poll live progress (the extension itself has
+/// no backend bridge to ask). Refreshed on every launch; a missing file
+/// simply leaves the dialog's "Default folder" placeholder in place.
+pub fn write_extension_defaults(
+    download_directory: &std::path::Path,
+    progress_port: Option<u16>,
+    progress_token: Option<&str>,
+) {
+    let Some(project) = directories::ProjectDirs::from("com", "PlayRood", "Yood") else {
+        return;
+    };
+    let dir = project.data_dir().join("yood-extension");
+    if fs::symlink_metadata(&dir)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let manifest_ready = fs::symlink_metadata(dir.join("manifest.json"))
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !manifest_ready && materialize_embedded_extension().is_none() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "download_directory": download_directory.to_string_lossy(),
+        "progress_port": progress_port,
+        "progress_token": progress_token,
+    });
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    if !write_materialized_file(&dir.join("defaults.json"), &serialized) {
+        logging::warn("could not publish extension defaults");
+    }
 }
 
 fn profile_dir() -> Option<PathBuf> {
@@ -219,7 +352,10 @@ fn seed_profile_prefs(profile: &std::path::Path) {
     seed_prefs_file(
         &profile.join("Default").join("Preferences"),
         &[
-            (&["brave", "p3a", "enabled"][..], serde_json::Value::Bool(false)),
+            (
+                &["brave", "p3a", "enabled"][..],
+                serde_json::Value::Bool(false),
+            ),
             (
                 &["brave", "p3a", "notice_acknowledged"][..],
                 serde_json::Value::Bool(true),
@@ -258,7 +394,10 @@ fn seed_profile_prefs(profile: &std::path::Path) {
     seed_prefs_file(
         &profile.join("Local State"),
         &[
-            (&["brave", "p3a", "enabled"][..], serde_json::Value::Bool(false)),
+            (
+                &["brave", "p3a", "enabled"][..],
+                serde_json::Value::Bool(false),
+            ),
             (
                 &["brave", "p3a", "notice_acknowledged"][..],
                 serde_json::Value::Bool(true),
@@ -280,6 +419,7 @@ fn seed_profile_prefs(profile: &std::path::Path) {
     // in missing keys and never override existing choices.
     seed_shields_aggressive(profile);
     seed_custom_filters(profile);
+    seed_protocol_handlers(profile);
 }
 
 /// Brave Shields aggressive mode for YouTube domains.
@@ -293,6 +433,81 @@ fn seed_profile_prefs(profile: &std::path::Path) {
 /// and writes the same file): `braveShields=1` (on), `shieldsAds=2`,
 /// `trackers=2`, `cosmeticFilteringV2={cosmeticFilteringV2:1}`.
 /// Unknown keys would be ignored by Brave, so this can only help.
+/// Pre-approve `yood://` for YouTube origins so Brave never shows its
+/// "Open Yood?" confirmation on every download handoff. Stores exactly what
+/// checking "Always allow" would store. Only fills in origins the user has
+/// never decided on — an explicit deny is left untouched.
+fn seed_protocol_handlers(profile: &std::path::Path) {
+    const DOMAINS: &[&str] = &[
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+    ];
+    let path = profile.join("Default").join("Preferences");
+    let mut data: serde_json::Value = read_profile_json(&path);
+    if !data.is_object() {
+        data = serde_json::json!({});
+    }
+    let mut changed = !fs::symlink_metadata(&path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    for domain in DOMAINS {
+        let origin = format!("https://{domain},*");
+        if protocol_decided(&data, &origin) {
+            continue;
+        }
+        let root = data.as_object_mut().expect("root object");
+        let handler = root
+            .entry("protocol_handler".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !handler.is_object() {
+            *handler = serde_json::json!({});
+        }
+        let allowed = handler
+            .as_object_mut()
+            .expect("protocol_handler object")
+            .entry("allowed_origin_protocol_pairs".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !allowed.is_object() {
+            *allowed = serde_json::json!({});
+        }
+        allowed
+            .as_object_mut()
+            .expect("allowed pairs object")
+            .insert(origin, serde_json::json!({"yood": true}));
+        changed = true;
+    }
+    if changed {
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_ok() {
+                let _ = write_materialized_file(
+                    &path,
+                    &serde_json::to_string(&data).unwrap_or_default(),
+                );
+            }
+        }
+    }
+}
+
+fn protocol_decided(data: &serde_json::Value, origin: &str) -> bool {
+    [
+        "allowed_origin_protocol_pairs",
+        "denied_origin_protocol_pairs",
+        "ignored_origin_protocol_pairs",
+    ]
+    .iter()
+    .any(|bucket| {
+        data.pointer(&format!("/protocol_handler/{bucket}"))
+            .and_then(|value| value.as_object())
+            .and_then(|map| map.get(origin))
+            .and_then(|entry| entry.as_object())
+            .is_some_and(|entry| entry.contains_key("yood"))
+    })
+}
+
 fn seed_shields_aggressive(profile: &std::path::Path) {
     const DOMAINS: &[&str] = &[
         "youtube.com",
@@ -312,14 +527,13 @@ fn seed_shields_aggressive(profile: &std::path::Path) {
         (micros + UNIX_TO_CHROMIUM_MICROS).to_string()
     };
     let path = profile.join("Default").join("Preferences");
-    let mut data: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let mut data: serde_json::Value = read_profile_json(&path);
     if !data.is_object() {
         data = serde_json::json!({});
     }
-    let mut changed = !path.exists();
+    let mut changed = !fs::symlink_metadata(&path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
     {
         let mut cursor = data.as_object_mut().expect("root object");
         for segment in ["profile", "content_settings", "exceptions"] {
@@ -331,7 +545,12 @@ fn seed_shields_aggressive(profile: &std::path::Path) {
             }
             cursor = entry.as_object_mut().expect("nested object");
         }
-        for key in ["braveShields", "shieldsAds", "trackers", "cosmeticFilteringV2"] {
+        for key in [
+            "braveShields",
+            "shieldsAds",
+            "trackers",
+            "cosmeticFilteringV2",
+        ] {
             let bucket = cursor
                 .entry(key.to_string())
                 .or_insert_with(|| serde_json::json!({}));
@@ -358,7 +577,8 @@ fn seed_shields_aggressive(profile: &std::path::Path) {
     }
     if changed {
         if std::fs::create_dir_all(path.parent().expect("profile has parent")).is_ok() {
-            let _ = std::fs::write(&path, serde_json::to_string(&data).unwrap_or_default());
+            let _ =
+                write_materialized_file(&path, &serde_json::to_string(&data).unwrap_or_default());
         }
     }
 }
@@ -381,14 +601,13 @@ fn seed_custom_filters(profile: &std::path::Path) {
         return;
     }
     let path = profile.join("Local State");
-    let mut data: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let mut data: serde_json::Value = read_profile_json(&path);
     if !data.is_object() {
         data = serde_json::json!({});
     }
-    let mut changed = !path.exists();
+    let mut changed = !fs::symlink_metadata(&path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
     {
         let root = data.as_object_mut().expect("root object");
         let brave = root
@@ -428,9 +647,27 @@ fn seed_custom_filters(profile: &std::path::Path) {
     }
     if changed {
         if std::fs::create_dir_all(path.parent().expect("profile has parent")).is_ok() {
-            let _ = std::fs::write(&path, serde_json::to_string(&data).unwrap_or_default());
+            let _ =
+                write_materialized_file(&path, &serde_json::to_string(&data).unwrap_or_default());
         }
     }
+}
+
+fn read_profile_json(path: &Path) -> serde_json::Value {
+    if fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > 4 * 1024 * 1024
+        })
+        .unwrap_or(true)
+    {
+        return serde_json::Value::Null;
+    }
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Sets each `(nested.key.path, value)` pair only if that key is not
@@ -444,7 +681,9 @@ fn seed_prefs_file(path: &std::path::Path, entries: &[(&[&str], serde_json::Valu
     if !data.is_object() {
         data = serde_json::json!({});
     }
-    let mut changed = !path.exists();
+    let mut changed = !fs::symlink_metadata(&path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
     for (segments, value) in entries {
         let Some((key, parents)) = segments.split_last() else {
             continue;
@@ -493,7 +732,8 @@ fn seed_prefs_file(path: &std::path::Path, entries: &[(&[&str], serde_json::Valu
 #[cfg(windows)]
 fn apply_windows_policies() {}
 
-fn has_active_downloads(downloads: &crate::download::DownloadManager) -> bool {    downloads.list().iter().any(|item| {
+fn has_active_downloads(downloads: &crate::download::DownloadManager) -> bool {
+    downloads.list().iter().any(|item| {
         matches!(
             item.status,
             DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Paused
@@ -507,10 +747,9 @@ pub fn launch(app: &tauri::AppHandle, runtime: &RuntimeState) -> Result<(), Stri
     let brave = bundled_or_system_brave().ok_or_else(|| {
         "no Brave browser found (set YOOD_BRAVE_DIR, stage one with scripts/fetch-brave.sh, or install brave-bin)".to_string()
     })?;
-    let profile = profile_dir()
-        .ok_or_else(|| "could not determine app directories".to_string())?;
-    if std::fs::create_dir_all(&profile).is_err() {
-        return Err("could not create Brave profile directory".to_string());
+    let profile = profile_dir().ok_or_else(|| "could not determine app directories".to_string())?;
+    if crate::security::ensure_safe_output_dir(&profile).is_err() {
+        return Err("could not create a safe Brave profile directory".to_string());
     }
     seed_profile_prefs(&profile);
     #[cfg(windows)]
@@ -533,10 +772,7 @@ pub fn launch(app: &tauri::AppHandle, runtime: &RuntimeState) -> Result<(), Stri
     #[cfg(target_os = "linux")]
     args.push("--class=yood".into());
     if let Some(extension) = extension_dir() {
-        logging::info(format!(
-            "Yood download buttons: companion extension at {}",
-            extension.display()
-        ));
+        logging::info("Yood download buttons: companion extension ready");
         args.push(format!("--load-extension={}", extension.display()));
     } else {
         logging::warn(
@@ -544,9 +780,8 @@ pub fn launch(app: &tauri::AppHandle, runtime: &RuntimeState) -> Result<(), Stri
         );
     }
     logging::info(format!(
-        "Yood {} launching Brave {} ({})",
+        "Yood {} launching Brave ({})",
         env!("CARGO_PKG_VERSION"),
-        brave.display(),
         std::env::consts::OS
     ));
     let mut cmd = Command::new(&brave);
@@ -572,19 +807,29 @@ pub fn launch(app: &tauri::AppHandle, runtime: &RuntimeState) -> Result<(), Stri
     std::thread::spawn(move || {
         // Poll the child: it stays owned by the global slot so the Exit
         // hook can take and kill it when Yood itself is asked to quit.
-        loop {
-            let exited = BRAVE_CHILD
-                .lock()
-                .map(|mut slot| match slot.as_mut() {
-                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+        let exit_status = loop {
+            let status = match BRAVE_CHILD.lock() {
+                Ok(mut slot) => match slot.as_mut() {
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => Some(Some(status)),
+                        Ok(None) => None,
+                        Err(error) => {
+                            logging::warn(format!("could not inspect Brave process: {error}"));
+                            Some(None)
+                        }
+                    },
                     // Taken by shutdown(): Brave is going away.
-                    None => true,
-                })
-                .unwrap_or(true);
-            if exited {
-                break;
+                    None => Some(None),
+                },
+                Err(_) => Some(None),
+            };
+            if let Some(status) = status {
+                break status;
             }
             std::thread::sleep(Duration::from_millis(500));
+        };
+        if let Some(status) = exit_status {
+            logging::info(format!("Brave exited with status {status}"));
         }
         *BRAVE_CHILD
             .lock()
@@ -604,7 +849,9 @@ pub fn launch(app: &tauri::AppHandle, runtime: &RuntimeState) -> Result<(), Stri
 
 /// Kill the supervised Brave process, if any (Yood is quitting).
 pub fn shutdown() {
-    let mut slot = BRAVE_CHILD.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut slot = BRAVE_CHILD
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     if let Some(mut child) = slot.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -614,6 +861,15 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_prefers_brave_when_available() {
+        if cfg!(windows) {
+            assert!(!default_webview_mode(true, false));
+            assert!(default_webview_mode(false, false));
+        }
+        assert!(default_webview_mode(true, true));
+    }
 
     fn temp_profile(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -653,18 +909,16 @@ mod tests {
         );
         // Existing user choice is never overridden.
         let prefs_path = profile.join("Default").join("Preferences");
-        let mut current: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&prefs_path).expect("prefs"),
-        )
-        .expect("json");
+        let mut current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs_path).expect("prefs"))
+                .expect("json");
         current["profile"]["content_settings"]["exceptions"]["shieldsAds"]["youtube.com,*"] =
             serde_json::json!({"last_modified": "1", "setting": 1});
         std::fs::write(&prefs_path, serde_json::to_string(&current).unwrap()).unwrap();
         seed_shields_aggressive(&profile);
-        let again: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&prefs_path).expect("prefs"),
-        )
-        .expect("json");
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs_path).expect("prefs"))
+                .expect("json");
         assert_eq!(
             again
                 .pointer("/profile/content_settings/exceptions/shieldsAds")
@@ -690,7 +944,10 @@ mod tests {
             .expect("custom filters seeded");
         assert!(filters.contains("||doubleclick.net^"));
         assert!(filters.contains("youtube.com##ytd-ad-slot-renderer"));
-        let count = filters.lines().filter(|line| line.trim() == "||doubleclick.net^").count();
+        let count = filters
+            .lines()
+            .filter(|line| line.trim() == "||doubleclick.net^")
+            .count();
         assert_eq!(count, 1);
         // Re-seeding must not duplicate, and user lines must survive.
         let path = profile.join("Local State");
@@ -699,7 +956,10 @@ mod tests {
         let slot = current
             .pointer_mut("/brave/ad_block/custom_filters")
             .expect("slot");
-        *slot = serde_json::Value::String(format!("{}||user-example.test^\n", slot.as_str().unwrap_or("")));
+        *slot = serde_json::Value::String(format!(
+            "{}||user-example.test^\n",
+            slot.as_str().unwrap_or("")
+        ));
         std::fs::write(&path, serde_json::to_string(&current).unwrap()).unwrap();
         seed_custom_filters(&profile);
         let again = std::fs::read_to_string(&path).expect("state");
@@ -708,9 +968,15 @@ mod tests {
             .pointer("/brave/ad_block/custom_filters")
             .and_then(|value| value.as_str())
             .expect("merged");
-        assert!(merged.contains("||user-example.test^"), "user filter survives");
+        assert!(
+            merged.contains("||user-example.test^"),
+            "user filter survives"
+        );
         assert_eq!(
-            merged.lines().filter(|line| line.trim() == "||doubleclick.net^").count(),
+            merged
+                .lines()
+                .filter(|line| line.trim() == "||doubleclick.net^")
+                .count(),
             1,
             "no duplicates after re-seed"
         );
@@ -718,14 +984,109 @@ mod tests {
     }
 
     #[test]
+    fn preapproves_yood_scheme_without_overriding_denials() {
+        let profile = temp_profile("protocols");
+        seed_protocol_handlers(&profile);
+        let text = std::fs::read_to_string(profile.join("Default").join("Preferences"))
+            .expect("preferences seeded");
+        let data: serde_json::Value = serde_json::from_str(&text).expect("valid prefs");
+        let allowed = data
+            .pointer("/protocol_handler/allowed_origin_protocol_pairs")
+            .and_then(|value| value.as_object())
+            .expect("allowed pairs seeded");
+        let entry = allowed
+            .get("https://www.youtube.com,*")
+            .expect("youtube origin");
+        assert_eq!(
+            entry.get("yood").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        // An explicit user deny is never overridden.
+        let prefs_path = profile.join("Default").join("Preferences");
+        let mut current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs_path).expect("prefs"))
+                .expect("json");
+        current["protocol_handler"]["denied_origin_protocol_pairs"]["https://youtu.be,*"] =
+            serde_json::json!({"yood": true});
+        current["protocol_handler"]["allowed_origin_protocol_pairs"]
+            .as_object_mut()
+            .expect("allowed map")
+            .remove("https://youtu.be,*");
+        std::fs::write(&prefs_path, serde_json::to_string(&current).unwrap()).unwrap();
+        seed_protocol_handlers(&profile);
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prefs_path).expect("prefs"))
+                .expect("json");
+        assert!(
+            again
+                .pointer("/protocol_handler/allowed_origin_protocol_pairs")
+                .and_then(|value| value.as_object())
+                .and_then(|map| map.get("https://youtu.be,*"))
+                .is_none(),
+            "user denial must survive re-seeding"
+        );
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    #[test]
     fn embedded_extension_ships_its_network_rules() {
-        assert!(EXTENSION_MANIFEST.contains("rules.json"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(EXTENSION_MANIFEST).expect("manifest parses");
+        let scripts = manifest
+            .pointer("/content_scripts")
+            .and_then(|scripts| scripts.as_array())
+            .expect("content scripts");
+        assert!(scripts.iter().any(|script| {
+            script.pointer("/world").and_then(|world| world.as_str()) == Some("MAIN")
+                && script.pointer("/js/0").and_then(|file| file.as_str()) == Some("page.js")
+        }));
+        assert!(!EXTENSION_PAGE_JS.is_empty());
+        assert!(!EXTENSION_APP_SHELL_JS.is_empty());
+        assert!(!EXTENSION_APP_ICON.is_empty());
+        assert_eq!(
+            manifest
+                .pointer("/web_accessible_resources/0/resources/0")
+                .and_then(|resource| resource.as_str()),
+            Some("app-icon.png")
+        );
+        assert!(scripts.iter().any(|script| {
+            script.pointer("/js/0").and_then(|file| file.as_str()) == Some("app-shell.js")
+                && script
+                    .pointer("/matches")
+                    .and_then(|matches| matches.as_array())
+                    .is_some_and(|matches| matches.iter().any(|pattern| pattern == "https://*/*"))
+        }));
+        assert!(
+            manifest
+                .pointer("/declarative_net_request/rule_resources/0/path")
+                .and_then(|path| path.as_str())
+                == Some("rules.json")
+        );
         let rules: serde_json::Value =
             serde_json::from_str(EXTENSION_RULES_JSON).expect("rules.json parses");
-        assert!(rules.as_array().map(|rules| !rules.is_empty()).unwrap_or(false));
-        let text = EXTENSION_RULES_JSON.to_ascii_lowercase();
-        for cdn in ["googlevideo.com", "ytimg.com", "gstatic.com"] {
-            assert!(!text.contains(cdn), "rules must never block {cdn}");
+        assert!(rules
+            .as_array()
+            .map(|rules| !rules.is_empty())
+            .unwrap_or(false));
+        let rules = rules.as_array().expect("rules array");
+        let main_frame = rules.iter().find(|rule| {
+            rule.pointer("/condition/resourceTypes")
+                .and_then(|types| types.as_array())
+                .is_some_and(|types| types.iter().any(|kind| kind == "main_frame"))
+        });
+        for allowed_domain in [
+            "googlevideo.com",
+            "ytimg.com",
+            "gstatic.com",
+            "google.co.il",
+        ] {
+            assert!(
+                main_frame
+                    .and_then(|rule| rule.pointer("/condition/excludedRequestDomains"))
+                    .and_then(|domains| domains.as_array())
+                    .is_some_and(|domains| domains.iter().any(|domain| domain == allowed_domain)),
+                "the main-frame navigation guard must allow {allowed_domain}"
+            );
         }
     }
 }

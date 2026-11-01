@@ -1,4 +1,4 @@
-export {};
+export { };
 
 const video = document.querySelector<HTMLVideoElement>("#player")!;
 const title = document.querySelector<HTMLElement>("#title")!;
@@ -50,18 +50,43 @@ async function load(payload: unknown): Promise<void> {
   try { await video.play(); } catch { playerStatus.textContent = "Ready — press play"; }
 }
 
-const tauri = (window as unknown as { __TAURI__?: { core?: { invoke?: (command: string, args?: Record<string, unknown>) => Promise<unknown> }, event?: { listen?: (event: string, callback: (event: { payload: unknown }) => void) => Promise<() => void> } } }).__TAURI__;
-void tauri?.event?.listen?.("player-load", (event) => { void load(event.payload); });
-void (async () => {
+type PlayerInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+const nativeWindow = window as unknown as {
+  __YOOD_NATIVE__?: { invoke?: PlayerInvoke };
+  __TAURI_INTERNALS__?: { invoke?: PlayerInvoke };
+  __TAURI__?: {
+    core?: { invoke?: PlayerInvoke };
+    event?: { listen?: (event: string, callback: (event: { payload: unknown }) => void) => Promise<() => void> };
+  };
+};
+const invoke = nativeWindow.__YOOD_NATIVE__?.invoke
+  ?? nativeWindow.__TAURI_INTERNALS__?.invoke
+  ?? nativeWindow.__TAURI__?.core?.invoke;
+let hasPayload = false;
+void nativeWindow.__TAURI__?.event?.listen?.("player-load", (event) => {
+  hasPayload = true;
+  void load(event.payload);
+});
+const takePayload = async (): Promise<void> => {
   // The Rust side already resolves playback to a ready-to-use URL (either a
   // file:// URL for a completed download or an https:// stream URL for a
   // "play in Yood Player" request) and sends it as `source`. Do not attempt
   // to re-resolve it as a filesystem path here.
-  const payload = await tauri?.core?.invoke?.("take_player_source") as { source?: string; title?: string } | null | undefined;
+  const payload = await invoke?.("take_player_source") as { source?: string; title?: string } | null | undefined;
   if (payload?.source) {
+    hasPayload = true;
     await load({ url: payload.source, title: payload.title });
   }
-})().catch(() => { playerStatus.textContent = "Native player source unavailable"; });
+};
+const pollPayload = async (): Promise<void> => {
+  try {
+    await takePayload();
+  } catch {
+    playerStatus.textContent = "Native player source unavailable";
+  }
+  window.setTimeout(() => { void pollPayload(); }, hasPayload ? 2000 : 750);
+};
+void pollPayload();
 video.addEventListener("error", () => { playerStatus.textContent = "The media could not be played by the platform player."; });
 video.addEventListener("loadedmetadata", () => {
   playerStatus.textContent = "Ready";
