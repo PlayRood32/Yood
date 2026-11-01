@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod browser;
 mod commands;
 mod desktop;
@@ -23,6 +25,61 @@ const INITIALIZATION: &str = concat!(
     include_str!("../../../shared/frontend/dist/injection.js")
 );
 
+// This runs before the page's own scripts. It keeps the raw Tauri IPC
+// function inside a closure and attaches a per-window capability token to
+// privileged commands. A page can call the bridge, but cannot recover the
+// token or invoke a privileged native command through the raw internals.
+const BRIDGE_SETUP: &str = r#"
+(() => {
+  const internals = window.__TAURI_INTERNALS__;
+  const rawInvoke = internals && internals.invoke;
+  if (!rawInvoke) return;
+  const allowed = new Set([
+    "get_system_appearance", "get_settings", "get_settings_for_ui", "get_app_info", "get_account_hints",
+    "get_desktop_environment", "tracking_protection_enabled", "check_filter_request",
+    "get_filter_script_rules", "inspect_url", "enqueue_download", "list_downloads",
+    "pause_download", "resume_download", "cancel_download", "retry_download",
+    "remove_download", "open_downloads", "open_download", "open_download_folder", "open_native_player",
+    "open_native_player_url", "open_external", "pick_folder", "resolve_media_path", "update_settings",
+    "update_filter_lists", "update_ytdlp", "set_account_hints", "clear_account_hints",
+    "plugin:event|listen", "plugin:event|unlisten"
+  ]);
+  const protectedCommands = new Set([
+    "enqueue_download", "pause_download", "resume_download", "cancel_download", "retry_download",
+    "remove_download", "open_downloads", "open_download", "open_download_folder", "open_native_player",
+    "open_native_player_url", "open_external", "pick_folder", "resolve_media_path", "get_settings_for_ui", "update_settings",
+    "update_filter_lists", "update_ytdlp", "get_account_hints", "set_account_hints", "clear_account_hints"
+  ]);
+  const token = __YoodBridgeToken__;
+  const invoke = async (command, args) => {
+    if (!allowed.has(command)) throw new Error("Yood command is not allowed");
+    const activation = navigator.userActivation;
+    if (protectedCommands.has(command) && activation && activation.hasBeenActive === false) {
+      throw new Error("Yood command requires an explicit user action");
+    }
+    const payload = Object.assign({}, args || {});
+    if (protectedCommands.has(command)) payload.yood_bridge_token = token;
+    return rawInvoke.call(internals, command, payload);
+  };
+  Object.defineProperty(window, "__YOOD_NATIVE__", {
+    value: Object.freeze({ invoke }),
+    configurable: false,
+    writable: false
+  });
+})();
+"#;
+
+fn initialization_script(bridge_token: &str) -> String {
+    format!(
+        "{}\n{}",
+        BRIDGE_SETUP.replace(
+            "__YoodBridgeToken__",
+            &serde_json::to_string(bridge_token).unwrap_or_else(|_| "\"\"".into())
+        ),
+        INITIALIZATION
+    )
+}
+
 pub fn run() {
     let startup_settings = settings::load().unwrap_or_default();
     logging::init(&startup_settings.log_level);
@@ -47,8 +104,9 @@ pub fn run() {
         // with --quit simply has nothing to do.
         return;
     }
-    // Brave-first: the embedded WebKit view stays only behind YOOD_WEBVIEW=1
-    // (it segfaults on YouTube player pages on affected systems).
+    // Linux keeps Brave as the compatibility default because WebKitGTK can
+    // crash on YouTube player pages. Windows defaults to the lighter WebView;
+    // YOOD_ENGINE=brave/webview explicitly selects either engine everywhere.
     let webview = browser::is_webview_mode();
     if webview {
         #[cfg(target_os = "linux")]
@@ -66,12 +124,15 @@ pub fn run() {
             focus_and_navigate(app, argv.into_iter().skip(1));
         }))
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
+            #[cfg(target_os = "windows")]
             {
                 // Best-effort: makes the yood:// scheme work even when Yood
-                // was launched from an AppImage that a user has not run
-                // through a desktop-integration tool. Failure here (for
-                // example xdg-mime being unavailable) must not stop startup.
+                // was launched from a portable Windows folder that a user has
+                // not run through an installer. Writes a per-user (HKCU)
+                // registration, no admin needed.
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let _ = app.deep_link().register_all();
             }
@@ -103,6 +164,22 @@ pub fn run() {
             let settings = runtime.settings.clone();
             runtime.downloads.set_app_handle(app.handle().clone());
             app.manage(runtime.clone());
+            if !webview {
+                // Publish the default download folder plus the authenticated
+                // localhost progress feed for the Brave companion extension.
+                let download_directory = runtime
+                    .settings
+                    .lock()
+                    .map(|settings| settings.download_directory.clone())
+                    .unwrap_or_else(|_| std::path::PathBuf::from("downloads"));
+                let progress_port = runtime.downloads.serve_progress();
+                let progress_token = runtime.downloads.progress_token();
+                browser::write_extension_defaults(
+                    &download_directory,
+                    progress_port,
+                    progress_token.as_deref(),
+                );
+            }
             // Cold start with yood://download?url=... (companion extension):
             // enqueue before the window even appears.
             for argument in std::env::args().skip(1) {
@@ -130,7 +207,10 @@ pub fn run() {
                     Err(error) => logging::warn(format!("filter list refresh failed: {error}")),
                 }
                 if let Ok(mut current) = settings.lock() {
-                    *current = candidate;
+                    crate::settings::merge_filter_state(&mut current, &candidate);
+                    if let Err(error) = crate::settings::save(&current) {
+                        logging::warn(format!("could not persist refreshed filter metadata: {error}"));
+                    }
                 }
             });
             }
@@ -140,7 +220,14 @@ pub fn run() {
             // Diagnostic knob, not a feature: YOOD_NO_HOOKS=1 runs pure
             // YouTube with no Yood scripts and no native request filter.
             // Used to bisect UI-process crashes (hooks vs. WebKit itself).
+            // Finer splits: YOOD_NO_SCRIPTS=1 keeps the native filter but
+            // skips the injected scripts; YOOD_NO_NATIVE_FILTER=1 keeps the
+            // scripts but skips the native decide-policy filter.
             let no_hooks = std::env::var_os("YOOD_NO_HOOKS").is_some();
+            let no_scripts =
+                no_hooks || std::env::var_os("YOOD_NO_SCRIPTS").is_some();
+            let no_native_filter =
+                no_hooks || std::env::var_os("YOOD_NO_NATIVE_FILTER").is_some();
             if no_hooks {
                 logging::warn("YOOD_NO_HOOKS=1: running without ad blocking or integration scripts");
             }
@@ -186,15 +273,15 @@ pub fn run() {
             if let Some(user_agent) = user_agent {
                 builder = builder.user_agent(&user_agent);
             }
-            let builder = if no_hooks {
+            let builder = if no_scripts {
                 builder
             } else {
-                builder.initialization_script(INITIALIZATION)
+                builder.initialization_script(initialization_script(&runtime.bridge_token))
             };
             let window = builder
             .on_navigation(is_supported_navigation)
             .build()?;
-            if !no_hooks {
+            if !no_native_filter {
                 install_native_filter(&window, filters)?;
             }
             let _ = window.set_focus();
@@ -206,6 +293,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            commands::get_settings_for_ui,
             commands::update_settings,
             commands::list_downloads,
             commands::enqueue_download,
@@ -231,9 +319,11 @@ pub fn run() {
             commands::open_download_folder,
             commands::open_external,
             commands::open_native_player,
+            commands::open_downloads,
             commands::open_native_player_url,
             commands::take_player_source,
             commands::resolve_media_path,
+            commands::pick_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Yood")
@@ -410,8 +500,7 @@ fn filter_response(
     use webkit2gtk::{
         PolicyDecisionExt, ResponsePolicyDecisionExt, URIRequestExt, URIResponseExt, WebViewExt,
     };
-    let Some(response_decision) =
-        decision.downcast_ref::<webkit2gtk::ResponsePolicyDecision>()
+    let Some(response_decision) = decision.downcast_ref::<webkit2gtk::ResponsePolicyDecision>()
     else {
         return false;
     };
@@ -513,16 +602,74 @@ fn self_test() -> error::AppResult<()> {
     }
     let rules: serde_json::Value =
         serde_json::from_str(include_str!("../../../shared/extension/yood/rules.json")).map_err(
-            |_| {
-                error::AppError::Internal("companion extension network rules are invalid".into())
-            },
+            |_| error::AppError::Internal("companion extension network rules are invalid".into()),
         )?;
-    let rules_text = rules.to_string().to_ascii_lowercase();
+    let rules_list = rules.as_array().ok_or_else(|| {
+        error::AppError::Internal("companion extension network rules are invalid".into())
+    })?;
+    let main_frame_rule = rules_list.iter().find(|rule| {
+        rule.pointer("/condition/resourceTypes")
+            .and_then(|types| types.as_array())
+            .is_some_and(|types| types.iter().any(|kind| kind == "main_frame"))
+    });
     for cdn in ["googlevideo.com", "ytimg.com", "gstatic.com"] {
-        if rules_text.contains(cdn) {
+        let allowed = main_frame_rule
+            .and_then(|rule| rule.pointer("/condition/excludedRequestDomains"))
+            .and_then(|domains| domains.as_array())
+            .is_some_and(|domains| domains.iter().any(|domain| domain == cdn));
+        if !allowed {
             return Err(error::AppError::Internal(
                 "companion extension rules must never block the content CDN".into(),
             ));
+        }
+        if rules_list.iter().any(|rule| {
+            rule.pointer("/condition/resourceTypes")
+                .and_then(|types| types.as_array())
+                .is_some_and(|types| !types.iter().any(|kind| kind == "main_frame"))
+                && rule.to_string().to_ascii_lowercase().contains(cdn)
+        }) {
+            return Err(error::AppError::Internal(
+                "companion extension rules must never block the content CDN".into(),
+            ));
+        }
+    }
+    // An unknown declarativeNetRequest resource type makes Brave reject the
+    // whole extension at load (no download buttons, no Alt+L bar anywhere),
+    // so validate every rule against the MV3 schema here instead of
+    // discovering it on a watch page. `ping` covers beacon requests.
+    const RESOURCE_TYPES: &[&str] = &[
+        "main_frame",
+        "sub_frame",
+        "stylesheet",
+        "script",
+        "image",
+        "font",
+        "object",
+        "xmlhttprequest",
+        "ping",
+        "csp_report",
+        "media",
+        "websocket",
+        "webtransport",
+        "webbundle",
+        "other",
+    ];
+    for rule in rules_list {
+        let types = rule
+            .pointer("/condition/resourceTypes")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                error::AppError::Internal("companion extension network rules are invalid".into())
+            })?;
+        for resource_type in types {
+            let valid = resource_type
+                .as_str()
+                .is_some_and(|name| RESOURCE_TYPES.contains(&name));
+            if !valid {
+                return Err(error::AppError::Internal(
+                    "companion extension network rules use an unknown resource type".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -562,6 +709,8 @@ fn startup_url() -> Option<String> {
 /// as navigation, plus strict option allow-lists, so a crafted link can
 /// never smuggle an arbitrary URL or yt-dlp argument into the backend
 /// (DownloadManager::enqueue re-validates everything again anyway).
+/// `directory`, when present, must be a plain path (no control characters);
+/// enqueue verifies it is a safe directory before anything is written.
 struct DownloadLink {
     url: String,
     mode: crate::models::DownloadMode,
@@ -571,6 +720,8 @@ struct DownloadLink {
     subtitles: bool,
     subtitle_language: Option<String>,
     embed_thumbnail: bool,
+    directory: Option<std::path::PathBuf>,
+    request_id: Option<String>,
 }
 
 fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
@@ -578,8 +729,10 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
     if url.scheme() != "yood" || url.host_str() != Some("download") {
         return None;
     }
-    let params: std::collections::HashMap<String, String> =
-        url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let params: std::collections::HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
     let target = params.get("url")?;
     if target.len() > 4096 {
         return None;
@@ -615,6 +768,19 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
         }
         _ => None,
     };
+    let request_id = match params.get("request_id") {
+        Some(request_id)
+            if !request_id.is_empty()
+                && request_id.len() <= 128
+                && request_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+        {
+            Some(request_id.clone())
+        }
+        Some(_) => return None,
+        None => None,
+    };
     Some(DownloadLink {
         url: parsed.to_string(),
         mode,
@@ -636,6 +802,16 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
             _ => None,
         },
         embed_thumbnail: params.get("embed_thumbnail").map(String::as_str) == Some("1"),
+        directory: match params.get("directory") {
+            Some(directory) if !directory.is_empty() => {
+                if directory.len() > 4096 || directory.chars().any(|c| c.is_control()) {
+                    return None;
+                }
+                Some(std::path::PathBuf::from(directory))
+            }
+            _ => None,
+        },
+        request_id,
     })
 }
 
@@ -657,8 +833,12 @@ fn enqueue_download_url(app: &tauri::AppHandle, argument: &str) {
         subtitle_language: link.subtitle_language,
         embed_thumbnail: link.embed_thumbnail,
         context: Some("extension".into()),
+        directory: link.directory,
+        request_id: link.request_id,
     };
     match state.downloads.enqueue(request) {
+        // Progress surfaces in the page's own downloads side panel (fed by
+        // the localhost progress server), so no separate window is opened.
         Ok(item) => logging::info(format!("queued download from extension: {}", item.id)),
         Err(error) => logging::warn(format!("extension download rejected: {error}")),
     }
@@ -726,14 +906,11 @@ mod tests {
         assert!(download_url_from_str("https://www.youtube.com/watch?v=abc123").is_none());
         assert!(download_url_from_str("yood://www.youtube.com/watch?v=abc123").is_none());
         assert!(download_url_from_str("yood://download").is_none());
-        assert!(download_url_from_str(
-            "yood://download?url=https%3A%2F%2Fexample.test%2Fevil"
-        )
-        .is_none());
-        assert!(download_url_from_str(
-            "yood://download?url=javascript%3Aalert(1)"
-        )
-        .is_none());
+        assert!(
+            download_url_from_str("yood://download?url=https%3A%2F%2Fexample.test%2Fevil")
+                .is_none()
+        );
+        assert!(download_url_from_str("yood://download?url=javascript%3Aalert(1)").is_none());
         // Unknown options rejected rather than smuggled through.
         assert!(download_url_from_str(
             "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&mode=evil"
@@ -745,6 +922,30 @@ mod tests {
         .is_none());
         assert!(download_url_from_str(
             "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&quality=8k"
+        )
+        .is_none());
+        // Optional per-download folder: accepted as a plain path, control
+        // characters rejected, missing means the default folder.
+        #[cfg(not(target_os = "windows"))]
+        let folder_url = "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&directory=%2Fhome%2Fuser%2FVideos";
+        #[cfg(target_os = "windows")]
+        let folder_url = "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&directory=C%3A%5CUsers%5Ctest%5CVideos";
+        let folder = download_url_from_str(folder_url).expect("download link with folder");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            folder.directory.as_deref(),
+            Some(std::path::Path::new("/home/user/Videos"))
+        );
+        #[cfg(target_os = "windows")]
+        assert!(folder.directory.is_some());
+        assert!(download_url_from_str(
+            "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123"
+        )
+        .expect("plain download link")
+        .directory
+        .is_none());
+        assert!(download_url_from_str(
+            "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&directory=%2Ftmp%2Fevil%0Aname"
         )
         .is_none());
     }

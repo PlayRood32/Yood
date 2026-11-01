@@ -85,7 +85,10 @@ mod tests {
     #[test]
     fn io_errors_map_to_typed_variants() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(matches!(AppError::from(denied), AppError::PermissionDenied(_)));
+        assert!(matches!(
+            AppError::from(denied),
+            AppError::PermissionDenied(_)
+        ));
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(matches!(AppError::from(missing), AppError::NotFound(_)));
         let other = std::io::Error::new(std::io::ErrorKind::Other, "boom");
@@ -94,7 +97,8 @@ mod tests {
 
     #[test]
     fn serde_and_url_errors_convert() {
-        let json = serde_json::from_str::<serde_json::Value>("{oops") as Result<_, serde_json::Error>;
+        let json =
+            serde_json::from_str::<serde_json::Value>("{oops") as Result<_, serde_json::Error>;
         assert!(matches!(
             AppError::from(json.unwrap_err()),
             AppError::Configuration(_)
@@ -108,7 +112,9 @@ mod tests {
 
     #[test]
     fn error_strings_are_user_facing() {
-        assert!(AppError::Storage("disk full".into()).to_string().contains("disk full"));
+        assert!(AppError::Storage("disk full".into())
+            .to_string()
+            .contains("disk full"));
         assert!(AppError::Timeout.to_string().contains("timed out"));
     }
 }

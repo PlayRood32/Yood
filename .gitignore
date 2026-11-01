@@ -7,6 +7,10 @@
 # Frontend
 **/node_modules/
 
+# Browser-generated extension artifacts (stale copies break loading:
+# Brave reuses a shipped _metadata instead of recompiling rules.json).
+shared/extension/yood/_metadata/
+
 # Logs / OS
 *.log
 .DS_Store

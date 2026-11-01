@@ -73,7 +73,60 @@ function installBootstrapAdShield() {
     else
         document.addEventListener("DOMContentLoaded", install, { once: true });
 }
+function installAuthRecovery() {
+    window.setTimeout(() => {
+        const host = location.hostname.toLowerCase();
+        const isAuthHost = host === "accounts.google.com" || host.endsWith(".accounts.google.com") ||
+            host === "accounts.youtube.com" || host.endsWith(".accounts.youtube.com");
+        if (!isAuthHost)
+            return;
+        if (document.getElementById("yood-auth-recovery"))
+            return;
+        const show = () => {
+            if (!document.body || document.getElementById("yood-auth-recovery"))
+                return;
+            const banner = document.createElement("aside");
+            banner.id = "yood-auth-recovery";
+            banner.setAttribute("role", "status");
+            banner.style.cssText = "position:fixed;z-index:2147483647;top:8px;left:8px;right:8px;display:flex;align-items:center;justify-content:center;gap:12px;padding:10px 14px;border:1px solid #555;border-radius:10px;background:#202124;color:#f1f3f4;font:14px system-ui,sans-serif;box-shadow:0 4px 20px #0008";
+            const message = document.createElement("span");
+            message.textContent = "Google sign-in is taking longer than expected. You can return to YouTube and retry without closing Yood.";
+            const retry = document.createElement("button");
+            retry.type = "button";
+            retry.textContent = "Return to YouTube";
+            retry.style.cssText = "padding:7px 12px;border:0;border-radius:16px;background:#8ab4f8;color:#202124;cursor:pointer";
+            retry.addEventListener("click", () => {
+                window.location.replace("https://www.youtube.com/");
+            });
+            const close = document.createElement("button");
+            close.type = "button";
+            close.textContent = "Dismiss";
+            close.style.cssText = "padding:7px 12px;border:1px solid #777;border-radius:16px;background:transparent;color:inherit;cursor:pointer";
+            close.addEventListener("click", () => banner.remove());
+            banner.append(message, retry, close);
+            document.body.appendChild(banner);
+        };
+        if (document.body)
+            show();
+        else
+            document.addEventListener("DOMContentLoaded", show, { once: true });
+    }, 12000);
+}
 (() => {
+    const host = location.hostname.toLowerCase();
+    const isAuthHost = host === "accounts.google.com" || host.endsWith(".accounts.google.com") ||
+        host === "accounts.youtube.com" || host.endsWith(".accounts.youtube.com");
+    if (isAuthHost) {
+        installAuthRecovery();
+        return;
+    }
+    if (host !== "youtube.com" &&
+        !host.endsWith(".youtube.com") &&
+        host !== "youtu.be" &&
+        !host.endsWith(".youtu.be") &&
+        host !== "youtube-nocookie.com" &&
+        !host.endsWith(".youtube-nocookie.com"))
+        return;
     installBootstrapAdShield();
     const install = () => {
         const documentRoot = document.documentElement;

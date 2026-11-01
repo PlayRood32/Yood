@@ -1,6 +1,20 @@
-# Changelog
+# 📝 Changelog
 
-## v1.0.0
+## 🛠️ v1.0.1 — Sign-in, downloads and YouTube controls
+
+- Keep Yood bootstrap overlays and page integration scripts limited to
+  YouTube domains so Google account pages remain unaffected during sign-in.
+- Route Brave extension requests to the authenticated local download API
+  through the extension service worker, avoiding cross-origin localhost
+  requests from YouTube page context.
+- Route Yood download and Watch later clicks in the capture phase so
+  YouTube's own event handlers cannot swallow them.
+- Make the URL bar toggle closed when activated again, and keep only the
+  left-side URL control beside back, forward, and reload.
+- Update the repository layout and Linux build instructions to reflect the
+  current `build.sh` workflow.
+
+## 🏷️ v1.0.0
 
 First tagged release.
 

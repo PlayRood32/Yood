@@ -14,6 +14,14 @@ pub const DEFAULT_FILTER_LIST_URLS: &[&str] = &[
     "https://raw.githubusercontent.com/easylist/EasyListHebrew/master/EasyListHebrew.txt",
 ];
 
+/// Keep filter metadata bounded before it reaches the network client or the
+/// adblock parser. These limits are deliberately conservative and are shared
+/// by the settings validator and the filter updater.
+pub const MAX_FILTER_LIST_SOURCES: usize = 32;
+pub const MAX_FILTER_SOURCE_BYTES: usize = 2048;
+pub const MAX_FILTER_ETAGS: usize = 64;
+pub const MAX_FILTER_ETAG_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Appearance {
@@ -49,14 +57,14 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         let project = directories::ProjectDirs::from("com", "PlayRood", "Yood");
-        let download_directory = project
-            .as_ref()
-            .map(|p| p.data_dir().join("downloads"))
-            .unwrap_or_else(|| PathBuf::from("downloads"));
+        let download_directory = directories::UserDirs::new()
+            .and_then(|u| u.video_dir().map(|p| p.join("Yood")))
+            .or_else(|| project.as_ref().map(|p| p.data_dir().join("downloads")))
+            .unwrap_or_else(|| std::env::temp_dir().join("yood-downloads"));
         let temp_directory = project
             .as_ref()
             .map(|p| p.cache_dir().join("tmp"))
-            .unwrap_or_else(|| PathBuf::from(".yood-tmp"));
+            .unwrap_or_else(|| std::env::temp_dir().join("yood-tmp"));
         Self {
             schema_version: 2,
             appearance: Appearance::System,
@@ -122,6 +130,11 @@ pub struct DownloadRequest {
     pub subtitle_language: Option<String>,
     pub embed_thumbnail: bool,
     pub context: Option<String>,
+    pub directory: Option<PathBuf>,
+    /// Client-generated idempotency key. It is optional for old deep links and
+    /// lets the localhost bridge safely retry a request after a lost response.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 impl Default for DownloadRequest {
@@ -137,6 +150,8 @@ impl Default for DownloadRequest {
             subtitle_language: None,
             embed_thumbnail: false,
             context: None,
+            directory: None,
+            request_id: None,
         }
     }
 }
@@ -205,6 +220,18 @@ pub struct BinaryStatus {
 pub struct FilterStatus {
     pub enabled: bool,
     pub tracking_enabled: bool,
+    #[serde(default)]
+    pub aggressive_tracking_enabled: bool,
+    /// Whether this backend has an implementation for the optional tracking
+    /// policy. Kept separate from `tracking_enabled` so callers can tell an
+    /// implemented-but-disabled policy from an unsupported one.
+    #[serde(default)]
+    pub tracking_supported: bool,
+    /// Whether the on-disk remote cache has been compiled into the active
+    /// engine yet. FilterManager starts with the small built-in list and
+    /// loads the cache lazily.
+    #[serde(default)]
+    pub cache_loaded: bool,
     pub rule_count: usize,
     pub last_success: Option<DateTime<Utc>>,
     pub cache_path: Option<PathBuf>,

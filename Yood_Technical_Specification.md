@@ -1,10 +1,25 @@
 # Yood — Technical Product Specification
 
-**Version:** 1.0  
-**Status:** Development Specification  
+**Version:** 1.2
+**Status:** Development specification and implementation snapshot
 **Target Platforms:** Windows and Linux  
 **Primary Use:** Private/family use  
 **Project Type:** Desktop YouTube-focused application
+
+> This document describes the current implementation where explicitly stated and the intended product requirements elsewhere. Requirements written as goals or acceptance criteria are not a claim that the feature has shipped or passed release testing. The implementation snapshot below records the current platform defaults and packaging.
+
+## Current Implementation Snapshot
+
+- **Application version:** 1.0.1
+- **Windows:** Tauri with the system WebView2 runtime by default. Brave is an optional compatibility engine; the Windows build script can stage portable Brave with `-BundleBrave`.
+- **Linux:** Brave is the default engine. Tauri WebKitGTK WebView mode is available as an alternative, but Brave is preferred because WebKit can fail on some YouTube player pages.
+- **Downloads:** `yt-dlp` and FFmpeg are staged by the platform build scripts and bundled with the application.
+- **Google sign-in isolation:** The WebView bootstrap and integration scripts are restricted to YouTube domains; Google account pages are left untouched. Google redirects remain allowed by the native navigation policy.
+- **Brave download handoff:** The companion extension's service worker makes token-authenticated requests to the loopback download API; YouTube page context does not contact the local API directly.
+- **YouTube controls:** Download and Watch later actions are handled before YouTube page click handlers; the URL control toggles the link bar, with one navigation control beside back/forward/reload.
+- **Windows package:** NSIS installer (`Yood_*_x64-setup.exe`).
+- **Linux packages:** AppImage and Debian package (`.deb`).
+- **Shared assets:** Frontend, companion extension, and filter list are maintained under `shared/` and used by both platform builds.
 
 ---
 
@@ -56,19 +71,22 @@ The implementation should use:
 | Main application | Rust |
 | Desktop framework | Tauri |
 | Frontend | HTML/CSS/TypeScript |
-| Windows WebView | WebView2 |
-| Linux WebView | WebKitGTK |
+| Windows default engine | Tauri WebView using the system WebView2 runtime |
+| Windows compatibility engine | Brave (system-installed or optionally bundled) |
+| Linux default engine | Brave app mode |
+| Linux alternative engine | Tauri WebView using WebKitGTK |
 | Download engine | yt-dlp |
 | Media muxing/conversion | FFmpeg |
 | Configuration | Rust-managed local configuration |
 | Secure credentials/session data | OS-native secure storage where practical |
-| Packaging | Native Windows installer + Linux package/AppImage as appropriate |
+| Windows packaging | NSIS installer |
+| Linux packaging | AppImage and Debian package |
 
 Electron and a bundled Chromium browser should **not** be used.
 
 CEF should also not be used unless a later technical investigation proves that the required YouTube functionality cannot be implemented reliably with Tauri's platform WebViews.
 
-The primary goal is to avoid shipping a complete browser engine and therefore reduce memory footprint.
+The primary goal is to avoid shipping a complete browser engine and therefore reduce memory footprint. Windows follows this approach by default. Linux currently defaults to Brave because of WebKit compatibility issues on some YouTube player pages; this is a platform-specific implementation choice, not a change to the Windows default.
 
 ---
 
@@ -81,23 +99,23 @@ The architecture should be separated into the following major components:
 │                  Yood App                   │
 │                                             │
 │  ┌───────────────────────────────────────┐  │
-│  │         YouTube WebView Layer         │  │
+│  │         YouTube Engine Layer          │  │
 │  │                                       │  │
 │  │  Official YouTube website             │  │
-│  │  Google authentication                 │  │
-│  │  YouTube player                        │  │
-│  │  YouTube UI                            │  │
+│  │  Tauri WebView or Brave app mode      │  │
+│  │  Platform-specific session/profile    │  │
+│  │  YouTube player and UI                │  │
 │  └───────────────────┬───────────────────┘  │
 │                      │                      │
 │  ┌───────────────────▼───────────────────┐  │
 │  │        Yood Integration Layer         │  │
 │  │                                       │  │
-│  │  Ad blocking                           │  │
-│  │  Download button injection             │  │
-│  │  Download UI integration               │  │
-│  │  Native player integration             │  │
-│  │  Keyboard shortcuts                    │  │
-│  │  Deep links                            │  │
+│  │  Ad blocking                          │  │
+│  │  Download button injection            │  │
+│  │  Download UI integration              │  │
+│  │  Native player integration            │  │
+│  │  Keyboard shortcuts                   │  │
+│  │  Deep links                           │  │
 │  └───────────────────┬───────────────────┘  │
 │                      │                      │
 │  ┌───────────────────▼───────────────────┐  │
@@ -200,7 +218,7 @@ Requirements:
 
 Because Google may change or restrict authentication behavior inside embedded WebViews, authentication must be isolated from the rest of the application.
 
-The implementation should have:
+The intended design is:
 
 ```text
 Authentication Manager
@@ -210,7 +228,7 @@ Authentication Manager
         └── Compatibility fallback
 ```
 
-The fallback must be implemented in code and must never expose passwords or authentication tokens to the Rust backend unnecessarily.
+**Current implementation note:** Yood relies on the active browser engine's persistent profile/session for Google sign-in. There is no separate Yood authentication manager or external-browser session-transfer flow implemented. The WebView initialization and integration layers must not run on Google account pages, so Yood overlays and scripts cannot cover or interfere with the sign-in flow. The compatibility fallback remains a product requirement and must not expose passwords or authentication tokens to the Rust backend unnecessarily.
 
 The application must never request or store a user's Google password itself.
 
@@ -360,7 +378,7 @@ Example:
 │ ○ Songs                     │
 │   Optimized audio download  │
 │                             │
-│        [ Download ]          │
+│        [ Download ]         │
 └─────────────────────────────┘
 ```
 
@@ -1046,56 +1064,35 @@ The application must not repeatedly retry failed network requests indefinitely.
 
 # 43. Installation
 
-A setup system must install everything required.
+Build prerequisites and end-user runtime requirements are different. The platform build scripts check or stage development/build dependencies; end users should not need Rust, Node.js, Tauri CLI, or Python.
 
-The user should not need to manually install:
+The build scripts stage `yt-dlp` and FFmpeg for packaging. On Windows, the application uses the installed WebView2 runtime by default; the current build script warns if it does not detect WebView2 but does not provision that runtime.
 
-- Rust
-- Node.js
-- Tauri
-- yt-dlp
-- FFmpeg
-- Python
-- WebView2 when it can be provisioned appropriately
-- Other development dependencies
-
-The development environment and end-user installation must be clearly separated.
+Keep development dependencies out of the end-user installation. Runtime provisioning beyond the bundled application resources must be documented for each platform.
 
 ---
 
 # 44. Windows Installer
 
-The Windows installer should:
+The current Windows build uses Tauri's NSIS bundle target. The build script checks for Rust, Node.js, Tauri CLI, and Visual Studio C++ tools; stages and verifies `yt-dlp.exe` and `ffmpeg.exe`; builds the shared frontend; and runs `cargo tauri build`.
 
-- Install Yood
-- Install/register required components
-- Bundle yt-dlp
-- Bundle FFmpeg
-- Create Start Menu shortcut
-- Optionally create Desktop shortcut
-- Register supported YouTube URL protocols/file associations as appropriate
-- Support clean uninstall
+The resulting installer is written to `windows/src-tauri/target/release/bundle/nsis/`. WebView2 is the default engine and is expected to be available on the target system. Portable Brave is optional and is staged only when requested with `-BundleBrave` or `YOOD_BUNDLE_BRAVE=1`.
 
-The installer must not require administrator privileges unless genuinely necessary.
+Release validation should also verify that the installer:
+
+- Installs Yood and registers any required components
+- Bundles yt-dlp and FFmpeg
+- Creates a Start Menu shortcut and optionally a Desktop shortcut
+- Registers supported YouTube URL protocols/file associations as appropriate
+- Supports clean uninstall
+
+Whether installation is per-user or requires elevation should be verified against the generated installer and documented as a release property.
 
 ---
 
 # 45. Linux Installation
 
-The project should provide a simple installation mechanism appropriate for private family use.
-
-Preferred options should be evaluated based on:
-
-- Dependency handling
-- Size
-- Startup performance
-- WebKitGTK availability
-- Ease of installation
-- Ease of removal
-
-An AppImage may be provided for portability, while a native package can be provided when dependency integration makes it preferable.
-
-The final implementation should choose the smallest practical distribution method.
+The current Tauri bundle targets are AppImage and Debian package (`.deb`). The Linux build stages platform binaries and shared assets before packaging. Release validation must cover installation, removal, runtime dependencies, and startup behavior for each package type.
 
 ---
 
@@ -1336,43 +1333,24 @@ The application should not attempt to defeat technical protections that are spec
 
 # 60. Project Structure
 
-The final implementation should use a modular structure similar to:
+The current repository is organized by platform, with common frontend and extension assets shared:
 
 ```text
 yood/
-├── src-tauri/
-│   ├── commands/
-│   ├── download/
-│   ├── player/
-│   ├── auth/
-│   ├── filtering/
-│   ├── settings/
-│   ├── security/
-│   ├── storage/
-│   ├── updates/
-│   ├── process/
-│   └── main.rs
-│
-├── frontend/
-│   ├── youtube/
-│   ├── downloads/
-│   ├── player/
-│   ├── settings/
-│   ├── components/
-│   ├── styles/
-│   └── integration/
-│
-├── binaries/
-│   ├── windows/
-│   └── linux/
-│
-├── filters/
-├── installer/
-├── tests/
-└── documentation/
+├── windows/
+│   ├── scripts/build-windows.ps1
+│   └── src-tauri/
+├── linux/
+│   ├── scripts/
+│   ├── run.sh
+│   └── src-tauri/
+└── shared/
+    ├── extension/yood/
+    ├── filters/
+    └── frontend/
 ```
 
-The exact structure may change during implementation, but responsibilities should remain separated.
+Each platform has its own Tauri configuration and Rust application source. Frontend, extension, and filter assets live in `shared/` and are referenced by both builds.
 
 ---
 
@@ -1558,36 +1536,27 @@ Only formats and capabilities actually offered by the source should be displayed
 
 # 67. Cross-Platform Testing
 
-Every major feature must be tested on:
+The platform-specific runtime differs; test each supported engine and package rather than assuming one WebView configuration applies to both platforms.
 
 ## Windows
 
-- Supported Windows versions
-- WebView2
-- Installer
-- File associations
-- Secure storage
-- Download paths
-- Native player
+- Default Tauri WebView with WebView2
+- Optional Brave engine, including the portable bundle when shipped
+- NSIS installer and clean uninstall
+- Deep links, download paths, secure storage, and native player
 
 ## Linux
 
-At least the primary supported distribution/environment should be tested.
-
-Test:
-
-- WebKitGTK
-- Package/AppImage installation
-- Secure storage availability
-- Download paths
-- Native player
-- System integration
+- Default Brave engine
+- Optional WebKitGTK WebView mode
+- AppImage and Debian package installation
+- Secure storage availability, download paths, native player, and system integration
 
 ---
 
 # 68. Acceptance Criteria
 
-The project is considered complete only when:
+These are product acceptance goals, not a declaration that the current 1.0.1 build has completed every item. Treat each item as incomplete until verified by implementation and release testing.
 
 - YouTube works normally.
 - Google login works.
@@ -1637,9 +1606,9 @@ The project is considered complete only when:
 
 ---
 
-# 69. Development Priorities
+# 69. Development Priorities (Nice)
 
-Implementation should proceed in this order:
+The following phases describe the intended development sequence. They are a roadmap, not a report of current completion; use the acceptance criteria and release testing to establish what is actually done.
 
 ## Phase 1 — Foundation
 

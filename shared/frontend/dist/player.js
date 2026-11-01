@@ -47,18 +47,36 @@ async function load(payload) {
         playerStatus.textContent = "Ready — press play";
     }
 }
-const tauri = window.__TAURI__;
-void tauri?.event?.listen?.("player-load", (event) => { void load(event.payload); });
-void (async () => {
+const nativeWindow = window;
+const invoke = nativeWindow.__YOOD_NATIVE__?.invoke
+    ?? nativeWindow.__TAURI_INTERNALS__?.invoke
+    ?? nativeWindow.__TAURI__?.core?.invoke;
+let hasPayload = false;
+void nativeWindow.__TAURI__?.event?.listen?.("player-load", (event) => {
+    hasPayload = true;
+    void load(event.payload);
+});
+const takePayload = async () => {
     // The Rust side already resolves playback to a ready-to-use URL (either a
     // file:// URL for a completed download or an https:// stream URL for a
     // "play in Yood Player" request) and sends it as `source`. Do not attempt
     // to re-resolve it as a filesystem path here.
-    const payload = await tauri?.core?.invoke?.("take_player_source");
+    const payload = await invoke?.("take_player_source");
     if (payload?.source) {
+        hasPayload = true;
         await load({ url: payload.source, title: payload.title });
     }
-})().catch(() => { playerStatus.textContent = "Native player source unavailable"; });
+};
+const pollPayload = async () => {
+    try {
+        await takePayload();
+    }
+    catch {
+        playerStatus.textContent = "Native player source unavailable";
+    }
+    window.setTimeout(() => { void pollPayload(); }, hasPayload ? 2000 : 750);
+};
+void pollPayload();
 video.addEventListener("error", () => { playerStatus.textContent = "The media could not be played by the platform player."; });
 video.addEventListener("loadedmetadata", () => {
     playerStatus.textContent = "Ready";

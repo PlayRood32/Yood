@@ -11,6 +11,7 @@ use std::{
 use chrono::Utc;
 use regex::Regex;
 
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const ERROR: u8 = 1;
 const WARN: u8 = 2;
 const INFO: u8 = 3;
@@ -125,12 +126,38 @@ pub fn init(level: &str) {
         let file = path.as_ref().and_then(|path| {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                }
             }
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()
+            if fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(path).ok()?;
+            if fs::metadata(path)
+                .map(|metadata| metadata.len() > MAX_LOG_BYTES)
+                .unwrap_or(false)
+            {
+                let _ = file.set_len(0);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+            }
+            Some(file)
         });
         Mutex::new(file)
     });
@@ -152,15 +179,24 @@ fn log(level: u8, message: &str) {
         TRACE => "TRACE",
         _ => "INFO",
     };
+    let message = redact_sensitive(message);
+    let message = message.chars().take(16 * 1024).collect::<String>();
     let line = format!(
         "{} {} {}\n",
         Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
         level_name,
-        redact_sensitive(message)
+        message
     );
     if let Some(file) = FILE.get() {
         if let Ok(mut guard) = file.lock() {
             if let Some(file) = guard.as_mut() {
+                if file
+                    .metadata()
+                    .map(|metadata| metadata.len() > MAX_LOG_BYTES)
+                    .unwrap_or(false)
+                {
+                    let _ = file.set_len(0);
+                }
                 let _ = file.write_all(line.as_bytes());
             }
         }
@@ -171,7 +207,7 @@ fn log(level: u8, message: &str) {
     // visibility helps development.
     #[cfg(debug_assertions)]
     if level <= WARN {
-        eprintln!("{} {}", level_name, redact_sensitive(message));
+        eprintln!("{} {}", level_name, redact_sensitive(&message));
     }
 }
 

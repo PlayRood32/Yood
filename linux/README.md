@@ -1,8 +1,8 @@
-# Yood for Linux
+# 🐧 Yood for Linux
 
 Linux-only build. Shared code lives in [`../shared/`](../shared/). Root guide: [`../README.md`](../README.md).
 
-## Quick start
+## 🚀 Quick start
 
 ```bash
 npm install --prefix ../shared/frontend
@@ -10,38 +10,31 @@ npm run build --prefix ../shared/frontend
 ./run.sh brave
 ```
 
-## Brave engine
+## 🦁 Brave engine
 
 ```bash
-../linux/scripts/fetch-brave.sh linux-x86_64
+./scripts/build.sh --bundle-brave
 ./run.sh brave
 ```
 
 Uses the bundled portable Brave first (`src-tauri/binaries/linux-x86_64/brave/brave`), then `/opt/brave-bin/brave`, `/opt/brave.com/brave/brave`, then `brave` / `brave-browser` / `brave-bin` on `PATH`.
 
-## Build
+## 🔧 Build
 
 ```bash
-./scripts/prepare-binaries.sh linux-x86_64
-cargo tauri build --config src-tauri/tauri.conf.json
+./scripts/build.sh
 ```
 
-Targets: `appimage`, `deb`. Resources include `gstreamer/` plus `../../shared/filters` and `../../shared/extension`.
+Add `--bundle-brave` to include portable Brave. The script stages `yt-dlp` and FFmpeg, builds the shared frontend, and runs `cargo tauri build`. Targets: `appimage`, `deb`. Resources include `gstreamer/` plus `../../shared/filters` and `../../shared/extension`.
 
-## Install (per-user, no root)
-
-```bash
-./scripts/install.sh src-tauri/target/release/bundle/appimage/yood_*_amd64.AppImage
-```
-
-## Self-test
+## 🧪 Self-test
 
 ```bash
 ./run.sh self-test
 ```
 
-## Layout
+## 🗂️ Layout
 
 - `src-tauri/` — Rust backend + `tauri.conf.json` (Linux-only)
-- `scripts/` — `fetch-brave.sh`, `prepare-binaries.sh`, `install.sh`, `lock-devtools.sh`
+- `scripts/build.sh` — stages dependencies and builds AppImage/DEB packages
 - `run.sh` — Linux-only helper (no Windows commands)

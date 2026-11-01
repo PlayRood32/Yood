@@ -25,6 +25,11 @@ pub fn validate_youtube_url(raw: &str) -> AppResult<Url> {
             "only HTTPS YouTube URLs are supported".into(),
         ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::InvalidInput(
+            "URL credentials are not allowed".into(),
+        ));
+    }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if !YOUTUBE_HOSTS
         .iter()
@@ -43,6 +48,9 @@ pub fn validate_youtube_url(raw: &str) -> AppResult<Url> {
 }
 
 pub fn is_supported_navigation(url: &Url) -> bool {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let allowed = [
         "youtube.com",
@@ -83,12 +91,11 @@ pub fn sanitize_filename(input: &str, fallback: &str, max_bytes: usize) -> Strin
         trimmed
     };
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    if reserved
-        .iter()
-        .any(|name| result.eq_ignore_ascii_case(name))
-    {
+    let stem = result.split('.').next().unwrap_or(&result);
+    if reserved.iter().any(|name| stem.eq_ignore_ascii_case(name)) {
         result.insert(0, '_');
     }
     while result.len() > max_bytes {
@@ -97,14 +104,62 @@ pub fn sanitize_filename(input: &str, fallback: &str, max_bytes: usize) -> Strin
     result.trim_end_matches(['.', ' ']).to_string()
 }
 
-pub fn validate_user_path(path: &Path, allowed_roots: &[&Path]) -> AppResult<PathBuf> {
+fn validate_absolute_path(path: &Path) -> AppResult<()> {
     if !path.is_absolute()
         || path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
+        || path.file_name().is_none()
     {
         return Err(AppError::UnsafePath(path.display().to_string()));
     }
+    Ok(())
+}
+
+fn reject_symlink_components(path: &Path) -> AppResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(AppError::UnsafePath(format!(
+                        "{} contains a symbolic link",
+                        path.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(AppError::UnsafePath(format!(
+                        "{} contains a non-directory component",
+                        path.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_root(path: &Path) -> AppResult<PathBuf> {
+    validate_absolute_path(path)?;
+    reject_symlink_components(path)?;
+    if path.exists() {
+        return Ok(fs::canonicalize(path)?);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::UnsafePath(path.display().to_string()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| AppError::UnsafePath(path.display().to_string()))?;
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+pub fn validate_user_path(path: &Path, allowed_roots: &[&Path]) -> AppResult<PathBuf> {
+    validate_absolute_path(path)?;
+    reject_symlink_components(path)?;
     let candidate = if path.exists() {
         fs::canonicalize(path)?
     } else {
@@ -116,7 +171,11 @@ pub fn validate_user_path(path: &Path, allowed_roots: &[&Path]) -> AppResult<Pat
                 .ok_or_else(|| AppError::UnsafePath(path.display().to_string()))?,
         )
     };
-    if !allowed_roots.iter().any(|root| candidate.starts_with(root)) {
+    let roots = allowed_roots
+        .iter()
+        .map(|root| canonicalize_root(root))
+        .collect::<AppResult<Vec<_>>>()?;
+    if !roots.iter().any(|root| candidate.starts_with(root)) {
         return Err(AppError::UnsafePath(format!(
             "{} is outside the allowed folders",
             path.display()
@@ -126,7 +185,10 @@ pub fn validate_user_path(path: &Path, allowed_roots: &[&Path]) -> AppResult<Pat
 }
 
 pub fn ensure_safe_output_dir(path: &Path) -> AppResult<()> {
+    validate_absolute_path(path)?;
+    reject_symlink_components(path)?;
     fs::create_dir_all(path)?;
+    reject_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(AppError::UnsafePath(format!(
@@ -150,6 +212,16 @@ mod tests {
         assert_eq!(sanitize_filename("...", "fallback", 100), "fallback");
         assert!(validate_youtube_url("https://www.youtube.com/watch?v=abc").is_ok());
         assert!(validate_youtube_url("https://example.test/watch?v=abc").is_err());
+        assert!(validate_youtube_url("https://user:pass@www.youtube.com/watch?v=abc").is_err());
+        assert!(!is_supported_navigation(
+            &Url::parse("http://www.youtube.com/").unwrap()
+        ));
+        assert!(is_supported_navigation(
+            &Url::parse("https://accounts.google.com/").unwrap()
+        ));
+        assert!(is_supported_navigation(
+            &Url::parse("https://consent.google.com/").unwrap()
+        ));
         assert!(validate_youtube_url("javascript:alert(1)").is_err());
     }
 }

@@ -9,7 +9,10 @@ const ACCOUNT_HINTS: &str = "account-hints";
 pub fn get_account_hints() -> AppResult<Option<String>> {
     let entry = keyring::Entry::new(SERVICE, ACCOUNT_HINTS)?;
     match entry.get_password() {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) if value.len() <= 4096 && !value.chars().any(|c| c.is_control()) => {
+            Ok(Some(value))
+        }
+        Ok(_) => Err(AppError::Storage("stored account label is invalid".into())),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(AppError::from(error)),
     }

@@ -25,6 +25,57 @@ const INITIALIZATION: &str = concat!(
     include_str!("../../../shared/frontend/dist/injection.js")
 );
 
+const BRIDGE_SETUP: &str = r#"
+(() => {
+  const internals = window.__TAURI_INTERNALS__;
+  const rawInvoke = internals && internals.invoke;
+  if (!rawInvoke) return;
+  const allowed = new Set([
+    "get_system_appearance", "get_settings", "get_settings_for_ui", "get_app_info", "get_account_hints",
+    "get_desktop_environment", "tracking_protection_enabled", "check_filter_request",
+    "get_filter_script_rules", "inspect_url", "enqueue_download", "list_downloads",
+    "pause_download", "resume_download", "cancel_download", "retry_download",
+    "remove_download", "open_downloads", "open_download", "open_download_folder", "open_native_player",
+    "open_native_player_url", "open_external", "pick_folder", "resolve_media_path", "update_settings",
+    "update_filter_lists", "update_ytdlp", "set_account_hints", "clear_account_hints",
+    "plugin:event|listen", "plugin:event|unlisten"
+  ]);
+  const protectedCommands = new Set([
+    "enqueue_download", "pause_download", "resume_download", "cancel_download", "retry_download",
+    "remove_download", "open_downloads", "open_download", "open_download_folder", "open_native_player",
+    "open_native_player_url", "open_external", "pick_folder", "resolve_media_path", "get_settings_for_ui", "update_settings",
+    "update_filter_lists", "update_ytdlp", "get_account_hints", "set_account_hints", "clear_account_hints"
+  ]);
+  const token = __YoodBridgeToken__;
+  const invoke = async (command, args) => {
+    if (!allowed.has(command)) throw new Error("Yood command is not allowed");
+    const activation = navigator.userActivation;
+    if (protectedCommands.has(command) && activation && activation.hasBeenActive === false) {
+      throw new Error("Yood command requires an explicit user action");
+    }
+    const payload = Object.assign({}, args || {});
+    if (protectedCommands.has(command)) payload.yood_bridge_token = token;
+    return rawInvoke.call(internals, command, payload);
+  };
+  Object.defineProperty(window, "__YOOD_NATIVE__", {
+    value: Object.freeze({ invoke }),
+    configurable: false,
+    writable: false
+  });
+})();
+"#;
+
+fn initialization_script(bridge_token: &str) -> String {
+    format!(
+        "{}\n{}",
+        BRIDGE_SETUP.replace(
+            "__YoodBridgeToken__",
+            &serde_json::to_string(bridge_token).unwrap_or_else(|_| "\"\"".into())
+        ),
+        INITIALIZATION
+    )
+}
+
 pub fn run() {
     let startup_settings = settings::load().unwrap_or_default();
     logging::init(&startup_settings.log_level);
@@ -51,6 +102,9 @@ pub fn run() {
     }
     // Brave-first: the embedded WebKit view stays only behind YOOD_WEBVIEW=1
     // (it segfaults on YouTube player pages on affected systems).
+    // Windows prefers installed or bundled Brave so its Shields and the
+    // companion extension handle YouTube ads. The WebView is a fallback when
+    // Brave is unavailable, or can be selected explicitly with YOOD_ENGINE.
     let webview = browser::is_webview_mode();
     if webview {
         #[cfg(target_os = "linux")]
@@ -68,6 +122,8 @@ pub fn run() {
             focus_and_navigate(app, argv.into_iter().skip(1));
         }))
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
@@ -100,14 +156,31 @@ pub fn run() {
                     .unwrap_or_default(),
             );
             logging::info(format!(
-                "Yood {} starting ({})",
+                "Yood {} starting ({}, {})",
                 env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS
+                std::env::consts::OS,
+                if webview { "Tauri WebView" } else { "Brave" }
             ));
             let filters = runtime.filters.clone();
             let settings = runtime.settings.clone();
             runtime.downloads.set_app_handle(app.handle().clone());
             app.manage(runtime.clone());
+            if !webview {
+                // Publish the default download folder plus the authenticated
+                // localhost progress feed for the Brave companion extension.
+                let download_directory = runtime
+                    .settings
+                    .lock()
+                    .map(|settings| settings.download_directory.clone())
+                    .unwrap_or_else(|_| std::path::PathBuf::from("downloads"));
+                let progress_port = runtime.downloads.serve_progress();
+                let progress_token = runtime.downloads.progress_token();
+                browser::write_extension_defaults(
+                    &download_directory,
+                    progress_port,
+                    progress_token.as_deref(),
+                );
+            }
             // Cold start with yood://download?url=... (companion extension):
             // enqueue before the window even appears.
             for argument in std::env::args().skip(1) {
@@ -135,7 +208,10 @@ pub fn run() {
                     Err(error) => logging::warn(format!("filter list refresh failed: {error}")),
                 }
                 if let Ok(mut current) = settings.lock() {
-                    *current = candidate;
+                    crate::settings::merge_filter_state(&mut current, &candidate);
+                    if let Err(error) = crate::settings::save(&current) {
+                        logging::warn(format!("could not persist refreshed filter metadata: {error}"));
+                    }
                 }
             });
             }
@@ -185,8 +261,13 @@ pub fn run() {
                     None
                 } else if let Ok(custom) = std::env::var("YOOD_UA") {
                     Some(custom)
-                } else {
+                } else if cfg!(target_os = "linux") {
                     Some("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36".to_string())
+                } else {
+                    // Keep WebView2's real Edge user agent on Windows. The
+                    // Linux Chrome override breaks browser-sensitive flows
+                    // such as Google sign-in.
+                    None
                 };
             if let Some(user_agent) = user_agent {
                 builder = builder.user_agent(&user_agent);
@@ -194,7 +275,7 @@ pub fn run() {
             let builder = if no_hooks {
                 builder
             } else {
-                builder.initialization_script(INITIALIZATION)
+                builder.initialization_script(initialization_script(&runtime.bridge_token))
             };
             let window = builder
             .on_navigation(is_supported_navigation)
@@ -211,6 +292,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            commands::get_settings_for_ui,
             commands::update_settings,
             commands::list_downloads,
             commands::enqueue_download,
@@ -236,9 +318,11 @@ pub fn run() {
             commands::open_download_folder,
             commands::open_external,
             commands::open_native_player,
+            commands::open_downloads,
             commands::open_native_player_url,
             commands::take_player_source,
             commands::resolve_media_path,
+            commands::pick_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Yood")
@@ -415,8 +499,7 @@ fn filter_response(
     use webkit2gtk::{
         PolicyDecisionExt, ResponsePolicyDecisionExt, URIRequestExt, URIResponseExt, WebViewExt,
     };
-    let Some(response_decision) =
-        decision.downcast_ref::<webkit2gtk::ResponsePolicyDecision>()
+    let Some(response_decision) = decision.downcast_ref::<webkit2gtk::ResponsePolicyDecision>()
     else {
         return false;
     };
@@ -470,12 +553,134 @@ fn filter_response(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn install_native_filter(
+    window: &WebviewWindow,
+    filters: filtering::FilterManager,
+) -> tauri::Result<()> {
+    window.with_webview(move |platform| {
+        use webview2_com::{
+            take_pwstr,
+            Microsoft::Web::WebView2::Win32::{
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            },
+            WebResourceRequestedEventHandler,
+        };
+        use windows::core::{HSTRING, PWSTR};
+
+        let controller = platform.controller();
+        let webview = match unsafe { controller.CoreWebView2() } {
+            Ok(webview) => webview,
+            Err(error) => {
+                logging::warn(format!("could not install Windows ad filter: {error}"));
+                return;
+            }
+        };
+        let environment = platform.environment();
+        let filter_uri = HSTRING::from("*");
+        if let Err(error) = unsafe {
+            webview
+                .AddWebResourceRequestedFilter(&filter_uri, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+        } {
+            logging::warn(format!("could not register Windows ad filter: {error}"));
+            return;
+        }
+
+        let handler = WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
+            let (Some(webview), Some(args)) = (sender, args) else {
+                return Ok(());
+            };
+            let request = match unsafe { args.Request() } {
+                Ok(request) => request,
+                Err(error) => {
+                    logging::debug(format!("could not inspect WebView2 request: {error}"));
+                    return Ok(());
+                }
+            };
+            let mut request_uri = PWSTR::null();
+            if let Err(error) = unsafe { request.Uri(&mut request_uri) } {
+                logging::debug(format!("could not read WebView2 request URL: {error}"));
+                return Ok(());
+            }
+            let request_url = take_pwstr(request_uri);
+            let mut source_uri = PWSTR::null();
+            if let Err(error) = unsafe { webview.Source(&mut source_uri) } {
+                logging::debug(format!("could not read WebView2 page URL: {error}"));
+                return Ok(());
+            }
+            let source_url = take_pwstr(source_uri);
+            if !is_youtube_filter_source(&source_url) {
+                return Ok(());
+            }
+
+            let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT(0);
+            if let Err(error) = unsafe { args.ResourceContext(&mut context) } {
+                logging::debug(format!("could not read WebView2 resource type: {error}"));
+                return Ok(());
+            }
+            let request_type = match context.0 {
+                1 => "sub_frame",
+                2 => "stylesheet",
+                3 => "image",
+                4 => "media",
+                5 => "font",
+                6 => "script",
+                7 | 8 => "xmlhttprequest",
+                10 | 14 => "ping",
+                11 => "websocket",
+                _ => "other",
+            };
+            if !filters.check_network_request(&request_url, &source_url, request_type) {
+                return Ok(());
+            }
+
+            let status = HSTRING::from("Blocked by Yood");
+            let headers = HSTRING::from("Content-Length: 0\r\n");
+            let response = match unsafe {
+                environment.CreateWebResourceResponse(None, 403, &status, &headers)
+            } {
+                Ok(response) => response,
+                Err(error) => {
+                    logging::warn(format!("could not block WebView2 request: {error}"));
+                    return Ok(());
+                }
+            };
+            if let Err(error) = unsafe { args.SetResponse(&response) } {
+                logging::warn(format!("could not apply WebView2 ad filter: {error}"));
+                return Ok(());
+            }
+            logging::debug(format!(
+                "blocked ad subresource ({request_type}): {request_url} (source {source_url})"
+            ));
+            Ok(())
+        }));
+
+        let mut token = 0;
+        if let Err(error) = unsafe { webview.add_WebResourceRequested(&handler, &mut token) } {
+            logging::warn(format!("could not activate Windows ad filter: {error}"));
+        }
+    })
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 fn install_native_filter(
     _window: &WebviewWindow,
     _filters: filtering::FilterManager,
 ) -> tauri::Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_youtube_filter_source(source_url: &str) -> bool {
+    let Ok(url) = Url::parse(source_url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com")
+        || host == "youtu.be"
 }
 
 fn self_test() -> error::AppResult<()> {
@@ -517,15 +722,75 @@ fn self_test() -> error::AppResult<()> {
         ));
     }
     let rules: serde_json::Value =
-        serde_json::from_str(include_str!("../../../shared/extension/yood/rules.json")).map_err(|_| {
-            error::AppError::Internal("companion extension network rules are invalid".into())
-        })?;
-    let rules_text = rules.to_string().to_ascii_lowercase();
+        serde_json::from_str(include_str!("../../../shared/extension/yood/rules.json")).map_err(
+            |_| error::AppError::Internal("companion extension network rules are invalid".into()),
+        )?;
+    let rules_list = rules.as_array().ok_or_else(|| {
+        error::AppError::Internal("companion extension network rules are invalid".into())
+    })?;
+    let main_frame_rule = rules_list.iter().find(|rule| {
+        rule.pointer("/condition/resourceTypes")
+            .and_then(|types| types.as_array())
+            .is_some_and(|types| types.iter().any(|kind| kind == "main_frame"))
+    });
     for cdn in ["googlevideo.com", "ytimg.com", "gstatic.com"] {
-        if rules_text.contains(cdn) {
+        let allowed = main_frame_rule
+            .and_then(|rule| rule.pointer("/condition/excludedRequestDomains"))
+            .and_then(|domains| domains.as_array())
+            .is_some_and(|domains| domains.iter().any(|domain| domain == cdn));
+        if !allowed {
             return Err(error::AppError::Internal(
                 "companion extension rules must never block the content CDN".into(),
             ));
+        }
+        if rules_list.iter().any(|rule| {
+            rule.pointer("/condition/resourceTypes")
+                .and_then(|types| types.as_array())
+                .is_some_and(|types| !types.iter().any(|kind| kind == "main_frame"))
+                && rule.to_string().to_ascii_lowercase().contains(cdn)
+        }) {
+            return Err(error::AppError::Internal(
+                "companion extension rules must never block the content CDN".into(),
+            ));
+        }
+    }
+    // An unknown declarativeNetRequest resource type makes Brave reject the
+    // whole extension at load (no download buttons, no Alt+L bar anywhere),
+    // so validate every rule against the MV3 schema here instead of
+    // discovering it on a watch page. `ping` covers beacon requests.
+    const RESOURCE_TYPES: &[&str] = &[
+        "main_frame",
+        "sub_frame",
+        "stylesheet",
+        "script",
+        "image",
+        "font",
+        "object",
+        "xmlhttprequest",
+        "ping",
+        "csp_report",
+        "media",
+        "websocket",
+        "webtransport",
+        "webbundle",
+        "other",
+    ];
+    for rule in rules_list {
+        let types = rule
+            .pointer("/condition/resourceTypes")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                error::AppError::Internal("companion extension network rules are invalid".into())
+            })?;
+        for resource_type in types {
+            let valid = resource_type
+                .as_str()
+                .is_some_and(|name| RESOURCE_TYPES.contains(&name));
+            if !valid {
+                return Err(error::AppError::Internal(
+                    "companion extension network rules use an unknown resource type".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -565,6 +830,8 @@ fn startup_url() -> Option<String> {
 /// as navigation, plus strict option allow-lists, so a crafted link can
 /// never smuggle an arbitrary URL or yt-dlp argument into the backend
 /// (DownloadManager::enqueue re-validates everything again anyway).
+/// `directory`, when present, must be a plain path (no control characters);
+/// enqueue verifies it is a safe directory before anything is written.
 struct DownloadLink {
     url: String,
     mode: crate::models::DownloadMode,
@@ -574,6 +841,8 @@ struct DownloadLink {
     subtitles: bool,
     subtitle_language: Option<String>,
     embed_thumbnail: bool,
+    directory: Option<std::path::PathBuf>,
+    request_id: Option<String>,
 }
 
 fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
@@ -581,8 +850,10 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
     if url.scheme() != "yood" || url.host_str() != Some("download") {
         return None;
     }
-    let params: std::collections::HashMap<String, String> =
-        url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let params: std::collections::HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
     let target = params.get("url")?;
     if target.len() > 4096 {
         return None;
@@ -618,6 +889,19 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
         }
         _ => None,
     };
+    let request_id = match params.get("request_id") {
+        Some(request_id)
+            if !request_id.is_empty()
+                && request_id.len() <= 128
+                && request_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+        {
+            Some(request_id.clone())
+        }
+        Some(_) => return None,
+        None => None,
+    };
     Some(DownloadLink {
         url: parsed.to_string(),
         mode,
@@ -639,6 +923,16 @@ fn download_url_from_str(argument: &str) -> Option<DownloadLink> {
             _ => None,
         },
         embed_thumbnail: params.get("embed_thumbnail").map(String::as_str) == Some("1"),
+        directory: match params.get("directory") {
+            Some(directory) if !directory.is_empty() => {
+                if directory.len() > 4096 || directory.chars().any(|c| c.is_control()) {
+                    return None;
+                }
+                Some(std::path::PathBuf::from(directory))
+            }
+            _ => None,
+        },
+        request_id,
     })
 }
 
@@ -660,8 +954,12 @@ fn enqueue_download_url(app: &tauri::AppHandle, argument: &str) {
         subtitle_language: link.subtitle_language,
         embed_thumbnail: link.embed_thumbnail,
         context: Some("extension".into()),
+        directory: link.directory,
+        request_id: link.request_id,
     };
     match state.downloads.enqueue(request) {
+        // Progress surfaces in the page's own downloads side panel (fed by
+        // the localhost progress server), so no separate window is opened.
         Ok(item) => logging::info(format!("queued download from extension: {}", item.id)),
         Err(error) => logging::warn(format!("extension download rejected: {error}")),
     }
@@ -729,14 +1027,11 @@ mod tests {
         assert!(download_url_from_str("https://www.youtube.com/watch?v=abc123").is_none());
         assert!(download_url_from_str("yood://www.youtube.com/watch?v=abc123").is_none());
         assert!(download_url_from_str("yood://download").is_none());
-        assert!(download_url_from_str(
-            "yood://download?url=https%3A%2F%2Fexample.test%2Fevil"
-        )
-        .is_none());
-        assert!(download_url_from_str(
-            "yood://download?url=javascript%3Aalert(1)"
-        )
-        .is_none());
+        assert!(
+            download_url_from_str("yood://download?url=https%3A%2F%2Fexample.test%2Fevil")
+                .is_none()
+        );
+        assert!(download_url_from_str("yood://download?url=javascript%3Aalert(1)").is_none());
         // Unknown options rejected rather than smuggled through.
         assert!(download_url_from_str(
             "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&mode=evil"
@@ -748,6 +1043,23 @@ mod tests {
         .is_none());
         assert!(download_url_from_str(
             "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&quality=8k"
+        )
+        .is_none());
+        // Optional per-download folder: accepted as a plain path, control
+        // characters rejected, missing means the default folder.
+        let folder = download_url_from_str(
+            "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&directory=C%3A%5CUsers%5Ctest%5CVideos",
+        )
+        .expect("download link with folder");
+        assert!(folder.directory.is_some());
+        assert!(download_url_from_str(
+            "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123"
+        )
+        .expect("plain download link")
+        .directory
+        .is_none());
+        assert!(download_url_from_str(
+            "yood://download?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc123&directory=C%3A%5Cbad%0Apath"
         )
         .is_none());
     }

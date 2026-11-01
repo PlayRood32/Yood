@@ -9,7 +9,8 @@
 #   build          Alias for build-linux
 #   build-linux    Compile for Linux (TUI: Arch/Debian/Fedora, Space=select, Enter=build)
 #   build-linux-run Build for Linux, then run the release binary
-#   brave          Launch YouTube in Brave app mode (stable engine + Shields)
+#   brave          Launch the canonical Yood backend in Brave engine mode
+#   webview        Launch the canonical Yood backend in lightweight WebView mode
 #   check          Type-check frontend + cargo check (no bundle)
 #   test           Run Rust unit tests
 #   self-test      Run `yood --self-test` (no WebView needed)
@@ -63,6 +64,16 @@ cmd_run() {
   fi
 }
 
+cmd_webview() {
+  local canonical_bin=""
+  for candidate in src-tauri/target/release/yood src-tauri/target/debug/yood; do
+    if [[ -x "${candidate}" ]]; then canonical_bin="${candidate}"; break; fi
+  done
+  [[ -n "${canonical_bin}" ]] || die "Build Yood first with './run.sh build-linux' or 'cargo tauri build'."
+  webkit_warning
+  YOOD_ENGINE=webview exec "${canonical_bin}" "$@"
+}
+
 pick_build_targets() {
   # Prints internal targets (bin/deb/rpm/appimage), one per line.
   # No args in a terminal opens a checklist: Space toggles, Enter starts.
@@ -73,15 +84,15 @@ pick_build_targets() {
       local choice
       choice=$(whiptail --title "Yood build for Linux" --checklist \
         "Space = select, Enter = start build (Esc cancels):" 15 60 3 \
-        "arch" "Arch" OFF \
-        "debian" "Debian" OFF \
-        "fedora" "Fedora" OFF \
+        "arch" "Arch pacman package (.pkg.tar.zst)" OFF \
+        "debian" "Debian (.deb)" OFF \
+        "fedora" "Fedora (.rpm)" OFF \
         3>&1 1>&2 2>&3) || return 1
       # shellcheck disable=SC2206
       local picked=(${choice//\"/}) mapped=() p
       for p in "${picked[@]}"; do
         case "${p}" in
-          arch) mapped+=(bin) ;;
+          arch) mapped+=(arch) ;;
           debian) mapped+=(deb) ;;
           fedora) mapped+=(rpm) ;;
           *) mapped+=("${p}") ;;
@@ -92,7 +103,7 @@ pick_build_targets() {
       return 0
     fi
     echo "Choose build targets (e.g. '1 2', empty cancels, Esc/Ctrl-C cancels):" >&2
-    echo "  1) Arch    (runnable binary, no installer)" >&2
+    echo "  1) Arch    (pacman package, .pkg.tar.zst)" >&2
     echo "  2) Debian  (.deb)" >&2
     echo "  3) Fedora  (.rpm)" >&2
     local answer names=(bin deb rpm) n picked=()
@@ -120,7 +131,7 @@ cmd_build_linux() {
       targets+=(bin deb rpm); continue
     fi
     case "${arg}" in
-      arch) if ! $seen_sep; then targets+=(bin); continue; fi ;;
+      arch) if ! $seen_sep; then targets+=(arch); continue; fi ;;
       debian) if ! $seen_sep; then targets+=(deb); continue; fi ;;
       fedora) if ! $seen_sep; then targets+=(rpm); continue; fi ;;
     esac
@@ -151,20 +162,33 @@ cmd_build_linux() {
   info "Staging Linux binaries (yt-dlp, ffmpeg)..."
   ./scripts/prepare-binaries.sh linux-x86_64
   info "Building Yood for Linux (this takes a while)..."
-  local bundles=()
+  local bundles=() want_arch=false want_bin=false
   for t in "${targets[@]}"; do
-    [[ "${t}" != "bin" ]] && bundles+=("${t}")
+    case "${t}" in
+      bin) want_bin=true ;;
+      arch) want_arch=true; want_bin=true ;; # the pacman package wraps the raw binary
+      *) bundles+=("${t}") ;;
+    esac
   done
   if [[ "${#bundles[@]}" -eq 0 ]]; then
     cargo tauri build --config src-tauri/tauri.conf.json --no-bundle "${passthrough[@]}"
   else
     local csv
     csv="$(IFS=,; echo "${bundles[*]}")"
+    # A bundle build also emits target/release/yood, so `arch`/`bin`
+    # need no extra pass when built alongside other bundles.
     cargo tauri build --config src-tauri/tauri.conf.json --bundles "${csv}" "${passthrough[@]}"
+  fi
+  if $want_arch; then
+    ./scripts/package-arch.sh
   fi
   info "Done."
   info "  runnable binary: src-tauri/target/release/yood"
   info "  bundles are in src-tauri/target/release/bundle/ (if any were built)"
+  if $want_arch; then
+    info "  Arch package: src-tauri/target/release/bundle/arch/*.pkg.tar.zst"
+    info "  install it with: sudo pacman -U src-tauri/target/release/bundle/arch/*.pkg.tar.zst"
+  fi
   info "  install with: ./run.sh install   |   run it with: ./run.sh build-linux-run"
 }
 
@@ -185,120 +209,19 @@ cmd_build_linux_run() {
 }
 
 cmd_brave() {
-  # The WebKitGTK engine segfaults deterministically on YouTube's full
-  # player pages (watch/shorts/mobile/live) on this system — verified with
-  # 13 configurations (rendering, UA, JIT, hooks, GStreamer, profile), while
-  # embed/MP4/MSE/homepage/search all survive, and Brave renders the same
-  # watch page cleanly. Until upstream WebKit is fixed, this is the stable
-  # way to watch: Brave + Shields ad blocking in app mode (no address bar,
-  # no tabs — feels like Yood), with an isolated profile.
-  #
-  # Debloat policy — only mechanisms verified against the real binary:
-  #  * BraveWallet binary-disabled via --disable-features (name confirmed
-  #    in the shipped binary; Rewards/News/VPN have no such feature name,
-  #    so they are neutralised by never surfacing: app mode hides all
-  #    toolbars, NTP is never opened, profile is fresh and isolated).
-  #  * Chromium bloat off: Translate, MediaRouter route providers, Sync,
-  #    crash reporting, first-run, default-browser check, domain reliability.
-  #  * Economy: renderer-process-limit caps RAM (one-window app needs few
-  #    renderers); notifications + permission prompts are denied outright
-  #    (no popups on top, no notification spam).
-  #  * Component updates stay ON on purpose: Brave Shields filter lists
-  #    update through them; turning them off would silently age ad blocking.
-  local brave_bin=""
-  if [[ -n "${YOOD_BRAVE_DIR:-}" && -x "${YOOD_BRAVE_DIR}/brave" ]]; then
-    brave_bin="${YOOD_BRAVE_DIR}/brave"
-  elif [[ -x src-tauri/binaries/linux-x86_64/brave/brave ]]; then
-    brave_bin="${PWD}/src-tauri/binaries/linux-x86_64/brave/brave"
-  fi
-  if [[ -z "${brave_bin}" ]]; then
-    # Prefer the real binary over distro wrapper scripts (e.g. Arch's
-    # /usr/bin/brave injects --password-store and user flag files).
-    for candidate in /opt/brave-bin/brave /opt/brave.com/brave/brave; do
-      if [[ -x "${candidate}" ]]; then brave_bin="${candidate}"; break; fi
-    done
-  fi
-  if [[ -z "${brave_bin}" ]]; then
-    brave_bin="$(command -v brave 2>/dev/null || command -v brave-browser 2>/dev/null || command -v brave-bin 2>/dev/null || true)"
-  fi
-  [[ -n "${brave_bin}" ]] || die "No Brave found. Run ./scripts/fetch-brave.sh linux-x86_64 or install brave-bin."
-  local profile="${YOOD_BRAVE_PROFILE:-${HOME}/.local/share/yood/brave-profile}"
-  mkdir -p "${profile}/Default"
-  if [[ ! -f "${profile}/Default/Preferences" ]]; then
-    cat > "${profile}/Default/Preferences" <<'EOF'
-{"brave":{"ai_chat":{"context_menu_enabled":false,"show_toolbar_button":false},"p3a":{"enabled":false,"notice_acknowledged":true}}}
-EOF
-    if [[ ! -f "${profile}/Local State" ]]; then
-      printf '%s' '{"brave":{"p3a":{"enabled":false,"notice_acknowledged":true}}}' > "${profile}/Local State"
+  # Compatibility command: always use the canonical Yood backend. This keeps
+  # the download queue, localhost bridge, settings, deep links, and
+  # single-instance handling in one process.
+  local canonical_bin=""
+  for candidate in src-tauri/target/release/yood src-tauri/target/debug/yood; do
+    if [[ -x "${candidate}" ]]; then
+      canonical_bin="${candidate}"
+      break
     fi
-  else
-    # Existing profile: fill in missing silencing keys without overriding
-    # anything the user already chose (kills the P3A top infobar, etc.).
-    # Covers both Default/Preferences and the profile-independent Local State.
-    python3 - "${profile}" <<'EOF' 2>/dev/null || true
-import json, os, sys
-
-def patch(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    brave = data.setdefault("brave", {})
-    p3a = brave.setdefault("p3a", {})
-    p3a.setdefault("enabled", False)
-    p3a.setdefault("notice_acknowledged", True)
-    ai = brave.setdefault("ai_chat", {})
-    ai.setdefault("context_menu_enabled", False)
-    ai.setdefault("show_toolbar_button", False)
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-base = sys.argv[1]
-os.makedirs(os.path.join(base, "Default"), exist_ok=True)
-patch(os.path.join(base, "Default", "Preferences"))
-patch(os.path.join(base, "Local State"))
-EOF
-  fi
-  local url="https://www.youtube.com"
-  local extra=()
-  local arg
-  for arg in "$@"; do
-    if [[ "${arg}" == "--" ]]; then continue; fi
-    if [[ "${arg}" =~ ^https?:// ]]; then url="${arg}"; else extra+=("${arg}"); fi
   done
-  if ! [[ "${url}" =~ ^https://([a-z0-9-]+\.)*(youtube\.com|youtu\.be|google\.com|accounts\.google\.com|accounts\.youtube\.com)(/|$|\?) ]]; then
-    die "Only YouTube/Google URLs are allowed (got: ${url})."
-  fi
-  info "Launching Brave app mode with Yood profile..."
-  info "  binary:  ${brave_bin}"
-  info "  profile: ${profile}"
-  info "  Shields (ad blocking) stays ON — do not disable it."
-  local brave_args=(
-    --app="${url}" --user-data-dir="${profile}"
-    --no-first-run --no-default-browser-check
-    --disable-sync --disable-breakpad --no-report-upload --disable-domain-reliability
-    --disable-features=BraveWallet,BraveVPN,AIChat,Translate,DialMediaRouteProvider
-    --renderer-process-limit=4 --disable-notifications --deny-permission-prompts
-  )
-  local ext=""
-  if [[ -d ../shared/extension/yood ]]; then
-    ext="${PWD}/../shared/extension/yood"
-  elif [[ -d "${HOME}/.local/share/yood/extension/yood" ]]; then
-    ext="${HOME}/.local/share/yood/extension/yood"
-  fi
-  if [[ -n "${ext}" ]]; then
-    brave_args+=(--load-extension="${ext}")
-    info "  download buttons: Yood companion extension loaded"
-  else
-    info "  download buttons: extension not found (expected at ../shared/extension/yood)"
-  fi
-  exec "${brave_bin}" "${brave_args[@]}" "${extra[@]}"
+  [[ -n "${canonical_bin}" ]] || die "Build Yood first with './run.sh build-linux' or 'cargo tauri build'."
+  info "Starting the canonical Yood backend in Brave mode..."
+  YOOD_ENGINE=brave exec "${canonical_bin}" "$@"
 }
 
 cmd_check() {
@@ -319,7 +242,7 @@ cmd_self_test() {
 
 cmd_clean() {
   info "Cleaning frontend dist + Rust target..."
-  rm -f ../shared/frontend/dist/bootstrap.js ../shared/frontend/dist/injection.js ../shared/frontend/dist/player.js
+  rm -f ../shared/frontend/dist/bootstrap.js ../shared/frontend/dist/injection.js ../shared/frontend/dist/player.js ../shared/frontend/dist/downloads.js ../shared/frontend/dist/downloads.html
   cargo clean --manifest-path src-tauri/Cargo.toml
   info "Clean done."
 }
@@ -328,6 +251,12 @@ cmd_install() {
   # Per-user install: double-clickable app, no terminal needed afterwards.
   # Uses the AppImage when the bundle step produced one, else the raw binary
   # (install.sh then bundles Brave + extension + registers yood://).
+  # A system-wide alternative on Arch: sudo pacman -U the package below.
+  local pkgs=(src-tauri/target/release/bundle/arch/yood-*-x86_64.pkg.tar.zst)
+  if [[ "${pkgs[0]}" != *"*"* && -f "${pkgs[0]}" ]]; then
+    info "Arch package available: ${pkgs[0]}"
+    info "System-wide install (needs sudo): sudo pacman -U \"${pkgs[0]}\""
+  fi
   local appimages=(src-tauri/target/release/bundle/appimage/yood_*_amd64.AppImage)
   if [[ "${appimages[0]}" != *"*"* && -f "${appimages[0]}" ]]; then
     exec ./scripts/install.sh "${appimages[0]}" "$@"
@@ -342,8 +271,9 @@ cmd_menu() {
   while true; do
     local choice=""
     if command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
-      choice=$(whiptail --title "Yood (Linux)" --menu "Recommended: brave (stable). Tauri/WebKit options crash on video pages:" 24 78 13 \
-        "brave" "RECOMMENDED: YouTube in Brave app mode (stable)" \
+      choice=$(whiptail --title "Yood (Linux)" --menu "Recommended: brave (stable). Tauri/WebView options are diagnostic on Linux:" 24 78 14 \
+        "brave" "RECOMMENDED: canonical backend with Brave engine (stable)" \
+        "webview" "Lightweight Tauri WebView engine (diagnostic on Linux)" \
         "dev" "Tauri dev (UNSTABLE: crashes on videos)" \
         "run" "Tauri binary (UNSTABLE: crashes on videos)" \
         "build-linux" "Compile Tauri for Linux" \
@@ -357,8 +287,8 @@ cmd_menu() {
         3>&1 1>&2 2>&3) || break
     else
       [[ -t 0 ]] || { cmd_help; return 0; }
-      echo "== Yood Linux (recommended: brave — Tauri/WebKit crashes on video pages) =="
-      local options=(dev run build-linux build-linux-run brave check test self-test install clean quit)
+      echo "== Yood Linux (recommended: brave — Tauri/WebView is diagnostic on Linux) =="
+      local options=(brave webview dev run build-linux build-linux-run check test self-test install clean quit)
       select choice in "${options[@]}"; do
         [[ -n "${choice:-}" ]] || { echo "Invalid choice, try again."; continue 2; }
         break
@@ -371,6 +301,7 @@ cmd_menu() {
       build-linux|build) cmd_build_linux || true ;;
       build-linux-run) cmd_build_linux_run || true ;;
       brave) cmd_brave || true ;;
+      webview) cmd_webview || true ;;
       check) cmd_check || true ;;
       test) cmd_test || true ;;
       self-test|selftest) cmd_self_test || true ;;
@@ -389,7 +320,8 @@ cmd_help() {
   echo
   echo "Examples:"
   echo "  ./run.sh                # open interactive TUI menu"
-  echo "  ./run.sh brave          # stable YouTube (Brave app mode + Shields)"
+  echo "  ./run.sh brave          # canonical backend with Brave engine (stable on Linux)"
+  echo "  ./run.sh webview        # canonical backend with lightweight WebView engine"
   echo "  ./run.sh dev            # Tauri/WebKit build (currently crashes on watch)"
   echo "  ./run.sh build-linux-run  # compile for Linux and run it"
   echo "  ./run.sh build-linux    # compile for Linux"
@@ -404,6 +336,7 @@ case "${cmd}" in
   build|build-linux) cmd_build_linux "$@" ;;
   build-linux-run) cmd_build_linux_run "$@" ;;
   brave) cmd_brave "$@" ;;
+  webview) cmd_webview "$@" ;;
   check) cmd_check "$@" ;;
   test) cmd_test "$@" ;;
   self-test|selftest) cmd_self_test "$@" ;;
