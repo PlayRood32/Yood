@@ -2,30 +2,76 @@
 
 # 🎥 Yood
 
-A small, private desktop YouTube app. Yood uses Brave app mode when available; Windows falls back to Tauri WebView if Brave is not installed.
+**A YouTube-first desktop app for Windows and Linux.**
+
+Watch YouTube in a focused app window, with integrated downloads, filtering,
+and an optional local player.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.90-orange.svg)](https://www.rust-lang.org)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-blue.svg)](https://tauri.app)
 
 </div>
 
-Current version: **1.0.1**
+**Current version: 1.0.1**
 
-Yood is a Rust/Tauri app. The main window is just YouTube itself; Yood adds the download manager, filtering, settings, and an optional local player around it.
+Yood is built with Rust, Tauri, and TypeScript. It uses the official YouTube
+website and account rather than recreating YouTube or requiring a separate
+media service. The app is designed as a player, not a general-purpose browser.
 
----
+## ✨ Features
 
-## ✨ What it does
+### A focused YouTube app
 
-- Opens the real YouTube site in Brave app mode when Brave is available, and falls back to Tauri WebView on Windows otherwise.
-- In Brave mode, keeps Brave Shields on with aggressive mode for YouTube, plus Yood's own rules.
-- Injects download buttons on watch and Shorts pages through a companion extension.
-- Handles `yood://` deep links and single-instance focus.
-- Downloads video / audio / songs with `yt-dlp` + `ffmpeg`, with live progress.
-- Optional native player window and ad-skip helper.
+- Opens YouTube in Brave app mode without ordinary browser tabs or an address
+  bar. Yood's icon is used throughout the app, and browser-only shortcuts and
+  context menus are suppressed while normal editing and media controls remain
+  available.
+- Linux uses Brave by default. Windows prefers installed or optionally bundled
+  Brave and falls back to the system WebView2 runtime if Brave is unavailable.
+- Keeps Google sign-in pages separate from Yood's YouTube page integration, so
+  account pages are not intercepted by YouTube controls or filters.
+- Provides a recovery prompt if a Google sign-in page remains open, so you can
+  return to YouTube and retry without restarting Yood.
+- Supports `yood://` links and single-instance behavior: opening another Yood
+  link focuses the running app and routes the link to it.
 
-## 🗂️ Project layout
+### YouTube controls and filtering
+
+- Adds Yood download controls to YouTube watch and Shorts pages.
+- Adds a Watch later action and keyboard shortcuts, including `Alt+L` for the
+  quick link bar.
+- Uses Brave Shields in aggressive mode for YouTube together with Yood's
+  network and cosmetic filter rules. WebView mode has a native request-filter
+  layer as well.
+- Keeps the Yood app shell and icon consistent across navigation while limiting
+  YouTube-specific page integration to YouTube domains.
+
+Ad filtering depends on the selected engine, active filter lists, and changes
+to YouTube. No filter can guarantee that every ad or promotion will be removed.
+
+### Downloads
+
+- Downloads video, audio, and songs with `yt-dlp` and FFmpeg.
+- Shows queued and active downloads with progress, speed, ETA, and errors.
+- Supports configurable download concurrency and controls to pause, resume,
+  cancel, retry, and remove downloads.
+- Supports playlist and channel selection, duplicate/overwrite handling, and
+  optional subtitles, thumbnails, and metadata.
+- Opens completed files or their containing folder from the download manager.
+- Displays a completion notification when a download finishes.
+
+### Player, settings, and privacy
+
+- Includes an optional native player window for local media and supported
+  stream URLs, plus an in-player ad-skip helper.
+- Provides system, light, and dark appearance options, along with settings for
+  downloads, storage, filtering, privacy, and shortcuts.
+- Stores app settings and logs locally. Yood's logs do not include passwords,
+  cookies, or tokens; Google sign-in is handled by Google and YouTube.
+- Includes a `--self-test` mode for basic startup and configuration checks.
+
+## 🗂️ Repository layout
 
 ```text
 ├── 📁 linux
@@ -66,9 +112,12 @@ Yood is a Rust/Tauri app. The main window is just YouTube itself; Yood adds the 
 ├── 📁 shared
 │   ├── 📁 extension
 │   │   └── 📁 yood
+│   │       ├── 🖼️ app-icon.png
+│   │       ├── 🟨 app-shell.js
 │   │       ├── 🟨 background.js
 │   │       ├── 🟨 content.js
 │   │       ├── 🌐 manifest.json
+│   │       ├── 🟨 page.js
 │   │       └── ⚙️ rules.json
 │   ├── 📁 filters
 │   │   └── 📝 default.txt
@@ -121,92 +170,130 @@ Yood is a Rust/Tauri app. The main window is just YouTube itself; Yood adds the 
 └── 📝 Yood_Technical_Specification.md
 ```
 
-`shared/` is referenced from both `src-tauri` trees via `../../shared/...`.
+`shared/` contains the frontend, extension, and filter list used by both
+platforms. Build scripts stage platform-specific `yt-dlp` and FFmpeg binaries
+under `src-tauri/binaries/`; those generated binaries and build outputs are not
+part of the source tree.
 
-## ✅ Requirements
+## 📦 Build
 
-Linux runtime:
-- Brave (bundled portable or system `brave` / `brave-browser` / `brave-bin`)
-- WebKit/GStreamer runtime for the optional WebView mode
+### Requirements
 
-Build:
-- Rust toolchain (MSRV 1.80)
-- Node.js
-- Tauri Linux deps (WebKitGTK etc.)
-- `curl`, `unzip`, `sha256sum`
+- Rust stable with Rust **1.90** or newer.
+- Node.js and npm.
+- **Linux:** Tauri's GTK/WebKitGTK development dependencies, GStreamer
+  dependencies, `curl`, `unzip`, and `sha256sum`. Exact package names vary by
+  distribution; see the [Linux guide](linux/README.md).
+- **Windows:** Visual Studio 2022 C++ Build Tools and the Tauri/NSIS build
+  prerequisites. WebView2 is needed when Yood uses the WebView fallback.
 
-Windows build additionally requires Visual Studio 2022 C++ Build Tools. The Windows application uses the system WebView2 runtime by default.
+The platform scripts check for or install the Tauri CLI and stage the required
+`yt-dlp` and FFmpeg binaries.
 
-## 🐧 Linux build
+### Linux
 
-One script does everything:
+From the repository root:
 
 ```bash
 ./linux/scripts/build.sh
 ```
 
-It checks prerequisites, stages `yt-dlp` and `ffmpeg`, builds the frontend, and runs `cargo tauri build`. Add `--bundle-brave` if you want a portable Brave included.
+The script builds the shared frontend and Linux app. By default, the Linux
+Tauri configuration creates **AppImage** and **DEB** bundles. Add
+`--bundle-brave` to include portable Brave, or `--install` to install after
+building. The standalone executable is produced at
+`linux/src-tauri/target/release/yood`.
 
-For a quick dev run:
+The Tauri RPM bundle can be built separately after staging the Linux resources,
+on a system with RPM packaging tools installed:
 
 ```bash
-./linux/run.sh brave
+cd linux/src-tauri
+cargo tauri build --bundles rpm
 ```
 
-## 🪟 Windows build
+For a development run, see [`linux/README.md`](linux/README.md) and
+[`linux/run.sh`](linux/run.sh). AppImage creation uses `linuxdeploy`, which may
+not work in every WSL environment; DEB and RPM packaging can be built
+independently.
 
-From PowerShell at the repo root:
+### Windows
+
+From the repository root, in PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\windows\scripts\build-windows.ps1
 ```
 
-That handles prerequisites, downloads `yt-dlp.exe` / `ffmpeg.exe`, builds the frontend, and produces the NSIS installer.
+This builds the frontend, stages `yt-dlp.exe` and `ffmpeg.exe`, and creates the
+NSIS installer under
+`windows\src-tauri\target\release\bundle\nsis\`. Add `-BundleBrave` to include
+portable Brave; otherwise Yood uses an installed Brave when available.
 
-## 🔗 Usage notes
+See the platform-specific guides for more details:
+[Linux](linux/README.md) · [Windows](windows/README.md) ·
+[shared assets](shared/README.md).
 
-- Deep links: `yood://www.youtube.com/watch?v=ID`, `yood://download?url=...`
-- A second `yood <url>` focuses the running instance instead of opening another.
-- Self-test: `yood --self-test` (Linux or Windows) checks config, URL policy, filters, and extension manifest.
+## 🔗 Usage
 
-## 📁 Config and logs
+- YouTube deep link: `yood://www.youtube.com/watch?v=VIDEO_ID`
+- Download deep link: `yood://download?url=YOUTUBE_URL`
+- Run `yood --self-test` to check configuration, URL policy, filters, and the
+  companion extension manifest.
+- Linux development helper: `./linux/run.sh brave`; self-test helper:
+  `./linux/run.sh self-test`.
 
-Linux:
-- Brave profile: `~/.local/share/com.playrood.yood/data/brave-profile`
-- Extension: `~/.local/share/com.playrood.yood/data/yood-extension`
-- Logs: `~/.local/share/com.playrood.yood/logs/yood.log`
+## 📁 Data and logs
 
-Windows:
-- Brave profile: `%APPDATA%\PlayRood\Yood\data\brave-profile`
-- Logs: `%APPDATA%\PlayRood\Yood\logs\yood.log`
+Yood keeps its app data in the current user's local application directories:
 
-Logs never contain passwords, cookies, or tokens.
+| Data | Linux | Windows |
+|---|---|---|
+| Brave profile | `~/.local/share/yood/brave-profile` | `%APPDATA%\PlayRood\Yood\data\brave-profile` |
+| Extension | `~/.local/share/yood/yood-extension` | `%APPDATA%\PlayRood\Yood\data\yood-extension` |
+| Logs | `~/.local/share/yood/logs/yood.log` | `%APPDATA%\PlayRood\Yood\data\logs\yood.log` |
 
-## ⚠️ Known limits
+Settings, download locations, and temporary-file behavior can be configured
+from the app. Logs do not contain passwords, cookies, or tokens.
 
-- On Linux, WebKit can still crash on YouTube player pages, so Linux defaults to Brave. Windows prefers installed or bundled Brave and falls back to Tauri WebView if none is found. Override with `YOOD_ENGINE=brave` or `YOOD_ENGINE=webview`.
-- Hotspot-style DRM rentals are out of scope (no Widevine in portable Brave builds; regular YouTube doesn't need it).
-- `https://` links can't open Yood without claiming all web traffic; use the `yood://` scheme.
-- Release bundles must stage real `yt-dlp`/`ffmpeg` binaries before packaging. `linux/scripts/build.sh` and `build-windows.ps1` do this for you.
+## 🛠️ Troubleshooting and limitations
 
-## 🛠️ Troubleshooting
+- **Google sign-in looks stuck:** Yood leaves Google account pages alone. If a
+  sign-in page remains open, use the recovery prompt to return to YouTube and
+  retry without restarting the app.
+- **Download controls are missing in Brave:** make sure the current Yood build
+  is running. If upgrading from a much older build does not restore the
+  controls, close Yood, remove its Brave profile once, and relaunch.
+- **A download button does not queue a download:** update to the latest build.
+  The companion extension relays authenticated requests through its service
+  worker instead of making local API requests from the YouTube page.
+- **Ads still appear:** check that Yood is using Brave. Brave mode combines
+  Shields, Yood's rules, and the companion extension; filtering can vary with
+  YouTube changes and is not guaranteed to remove every promotion.
+- **Brave was not found:** install Brave, set `YOOD_BRAVE_DIR`, or rebuild with
+  `--bundle-brave`. Use `YOOD_ENGINE=brave` or `YOOD_ENGINE=webview` to select
+  an engine explicitly.
+- **Linux WebKit crashes on video pages:** use the default Brave engine;
+  WebKit mode is available primarily as an alternative or diagnostic path.
+- **DRM-protected rentals:** portable Brave builds do not include Widevine, so
+  some DRM-protected content may not play.
+- **Opening ordinary `https://` links:** Yood registers the `yood://` scheme
+  rather than claiming every web URL on the system.
 
-- **Google sign-in appears stuck**: Yood does not run its YouTube integration on Google's sign-in page. If it stays open for 12 seconds, use the recovery banner to return to YouTube and retry without restarting Yood.
-- **Download button does not queue a download**: update to the latest build. Brave's companion extension now relays its authenticated local requests through its service worker instead of issuing cross-origin localhost requests from the YouTube page.
-- **Download buttons / Alt+L missing in Brave**: Chromium needs Developer Mode in the profile. Yood seeds it on first creation. If you ran an older build, delete the profile once and relaunch.
-- **YouTube ads**: confirm the Yood log says it started with `Brave`. Brave mode uses Shields in aggressive mode, Yood's custom rules, and the companion extension; install Brave or build with bundled Brave if Yood falls back to WebView.
-- **No Brave found**: set `YOOD_BRAVE_DIR`, run `./linux/scripts/build.sh --bundle-brave`, or install `brave-bin`. Use `YOOD_SKIP_BRAVE=1` + `YOOD_ENGINE=webview` for a WebView-only setup.
-- **WebKit crashes on video pages (Linux)**: use Brave mode (default on Linux). `YOOD_ENGINE=webview` is the diagnostic path.
-
-## 🧑‍💻 Development
+## 🧑‍💻 Development and tests
 
 ```bash
-cargo fmt
-cargo check --manifest-path linux/src-tauri/Cargo.toml
-cargo test --manifest-path linux/src-tauri/Cargo.toml
+npm install --prefix shared/frontend
 npm run build --prefix shared/frontend
+cargo fmt --manifest-path linux/src-tauri/Cargo.toml
+cargo test --manifest-path linux/src-tauri/Cargo.toml
+cargo test --manifest-path windows/src-tauri/Cargo.toml
 ```
 
-## 📄 License
+The Rust backends are maintained separately per platform and share the
+frontend, companion extension, and filter assets.
 
-MIT. See `linux/src-tauri/Cargo.toml`.
+## 📄 License and release notes
+
+Yood is licensed under the MIT License; see [`LICENSE`](LICENSE). Version
+history is in [`CHANGES.md`](CHANGES.md).
