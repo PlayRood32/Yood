@@ -424,6 +424,20 @@ const css = `
 #yood-auth-fallback { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%); z-index: 2147483640; display: flex; gap: 10px; align-items: center; padding: 10px 14px; border: 1px solid #444; border-radius: 12px; background: #181818e8; box-shadow: 0 4px 16px #0008; font-size: 13px; max-width: min(560px, calc(100vw - 32px)); }
 #yood-auth-fallback span { flex: 1; }
 #yood-auth-fallback button { flex: none; }
+/* In fullscreen video playback Yood's floating chrome would overlay the
+   picture; hide every non-modal HUD element so the video stays clean, and
+   bring them back when the user leaves fullscreen. */
+:root.yood-hud-hidden #yood-dock,
+:root.yood-hud-hidden #yood-navigation,
+:root.yood-hud-hidden #yood-download-bar,
+:root.yood-hud-hidden .yood-video-actions-fallback,
+:root.yood-hud-hidden #yood-watch-later-panel,
+:root.yood-hud-hidden #yood-toast,
+:root.yood-hud-hidden #yood-urlbar,
+:root.yood-hud-hidden #yood-auth-fallback,
+:root.yood-hud-hidden .yood-download-button,
+:root.yood-hud-hidden .yood-watch-later-button,
+:root.yood-hud-hidden .yood-native-player-button { display: none !important; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; } }
 `;
 
@@ -897,7 +911,7 @@ async function showPlaylistDialog(url: string, kind: "playlist" | "channel"): Pr
     selectAll.addEventListener("click", () => list.querySelectorAll<HTMLInputElement>("input").forEach((input) => input.checked = true));
     selectNone.addEventListener("click", () => list.querySelectorAll<HTMLInputElement>("input").forEach((input) => input.checked = false));
     selectActions.append(selectAll, selectNone); card.append(selectActions, list);
-    const options = document.createElement("div"); options.innerHTML = `<h3>Download options</h3><div class="yood-row"><label>Mode</label><select id="yood-list-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select></div><div class="yood-row"><label>Quality</label><select id="yood-list-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option></select></div><div class="yood-row"><label for="yood-list-folder">Save to</label><input id="yood-list-folder" type="text" placeholder="Loading…"><button id="yood-list-folder-browse" type="button" class="yood-secondary">Browse…</button></div>`;
+    const options = document.createElement("div"); options.innerHTML = `<h3>Download options</h3><div class="yood-row"><label>Mode</label><select id="yood-list-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select></div><div class="yood-row"><label>Quality</label><select id="yood-list-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option></select></div><div class="yood-row"><label for="yood-list-folder">Save to</label><input id="yood-list-folder" type="text" placeholder="Loading…"><button id="yood-list-folder-browse" type="button" class="yood-secondary">Browse…</button></div><div class="yood-row"><label><input id="yood-list-subs" type="checkbox"> Download subtitles</label></div><div class="yood-row"><label for="yood-list-sub-lang">Subtitle language</label><input id="yood-list-sub-lang" type="text" value="en" placeholder="en"></div>`;
     const browseListFolder = options.querySelector<HTMLButtonElement>("#yood-list-folder-browse");
     browseListFolder?.addEventListener("click", async () => {
       browseListFolder.disabled = true;
@@ -911,6 +925,12 @@ async function showPlaylistDialog(url: string, kind: "playlist" | "channel"): Pr
       const value = (settings as { download_directory?: unknown }).download_directory;
       const input = options.querySelector<HTMLInputElement>("#yood-list-folder");
       if (typeof value === "string" && input && input.value === "") input.value = value;
+      const lang = (settings as { subtitle_language?: unknown }).subtitle_language;
+      const subs = (settings as { download_subtitles?: unknown }).download_subtitles;
+      const langInput = options.querySelector<HTMLInputElement>("#yood-list-sub-lang");
+      if (typeof lang === "string" && langInput) langInput.value = lang;
+      const subsInput = options.querySelector<HTMLInputElement>("#yood-list-subs");
+      if (typeof subs === "boolean" && subsInput) subsInput.checked = subs;
     }).catch(() => undefined);
     card.appendChild(options);
     const actions = document.createElement("div"); actions.className = "yood-actions";
@@ -923,7 +943,9 @@ async function showPlaylistDialog(url: string, kind: "playlist" | "channel"): Pr
         const mode = (card.querySelector("#yood-list-mode") as HTMLSelectElement).value;
         const quality = (card.querySelector("#yood-list-quality") as HTMLSelectElement).value;
         const directory = (card.querySelector("#yood-list-folder") as HTMLInputElement).value.trim();
-        for (const entryUrl of selected) await invoke("enqueue_download", { request: { url: entryUrl, mode, quality, container: "mp4", context: kind, directory: directory || undefined } });
+        const subtitles = (card.querySelector("#yood-list-subs") as HTMLInputElement).checked;
+        const subtitle_language = (card.querySelector("#yood-list-sub-lang") as HTMLInputElement).value.trim() || "en";
+        for (const entryUrl of selected) await invoke("enqueue_download", { request: { url: entryUrl, mode, quality, container: "mp4", subtitles, subtitle_language, context: kind, directory: directory || undefined } });
         closeOverlay(); toast(`Added ${selected.length} video${selected.length === 1 ? "" : "s"} to the queue`);
       } catch (error) { toast(`Could not queue playlist: ${String(error)}`); start.disabled = false; }
     });
@@ -2293,10 +2315,59 @@ function installDevtoolsBlock(): void {
   }, true);
 }
 
+function installFullscreenHiding(): void {
+  const root = (): HTMLElement => document.documentElement;
+  const hudHidden = "yood-hud-hidden";
+  const pick = (): Element | null =>
+    document.querySelector(
+      "#movie_player.ytp-fullscreen, #movie_player.ytp-theater, ytd-watch-flexy[fullscreen], ytd-watch-flexy[theater], .html5-video-player.ytp-fullscreen"
+    );
+
+  let lastNativeFullscreen = false;
+  let lastYoutubeFullscreen = false;
+  let lastAppliedAt = 0;
+  const apply = (): void => {
+    const now = Date.now();
+    if (now - lastAppliedAt < 60) return;
+    lastAppliedAt = now;
+    const nativeFullscreen = Boolean(
+      document.fullscreenElement ||
+      (document as Document & { webkitFullscreenElement?: Element | null }).webkitFullscreenElement ||
+      (document as Document & { msFullscreenElement?: Element | null }).msFullscreenElement ||
+      (document as Document & { mozFullScreenElement?: Element | null }).mozFullScreenElement
+    );
+    const youtubeFullscreen = Boolean(pick());
+    if (nativeFullscreen === lastNativeFullscreen && youtubeFullscreen === lastYoutubeFullscreen) return;
+    lastNativeFullscreen = nativeFullscreen;
+    lastYoutubeFullscreen = youtubeFullscreen;
+    root().classList.toggle(hudHidden, nativeFullscreen || youtubeFullscreen);
+  };
+
+  document.addEventListener("fullscreenchange", apply);
+  document.addEventListener("webkitfullscreenchange", apply);
+  document.addEventListener("mozfullscreenchange", apply);
+  document.addEventListener("msfullscreenchange", apply);
+  window.addEventListener("resize", apply);
+
+  const observer = new MutationObserver(() => apply());
+  const watch = (): void => {
+    const watcher = document.querySelector("#movie_player, ytd-watch-flexy");
+    if (watcher) observer.observe(watcher, { attributes: true, attributeFilter: ["class", "fullscreen", "theater"] });
+  };
+  watch();
+  window.addEventListener("yt-navigate-finish", () => {
+    observer.disconnect();
+    watch();
+    apply();
+  });
+  apply();
+}
+
 function install(): void {
   if (!isYoodPage) return;
   if (window.__YOOD__) return;
   window.__YOOD__ = { invoke, scan };
+  installFullscreenHiding();
   installDevtoolsBlock();
   installYoodControlClickCapture();
   installPlayerAdSkip();

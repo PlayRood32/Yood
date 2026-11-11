@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Yood desktop permissions",
-  "windows": ["main", "native-player", "downloads"],
+  "windows":  ["main", "downloads"],
   "permissions": [
     "core:default",
     "core:event:allow-listen",

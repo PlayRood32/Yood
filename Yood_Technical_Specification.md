@@ -10,7 +10,7 @@
 
 ## Current Implementation Snapshot
 
-- **Application version:** 1.0.1
+- **Application version:** 1.0.2
 - **Windows:** Tauri with the system WebView2 runtime by default. Brave is an optional compatibility engine; the Windows build script can stage portable Brave with `-BundleBrave`.
 - **Linux:** Brave is the default engine. Tauri WebKitGTK WebView mode is available as an alternative, but Brave is preferred because WebKit can fail on some YouTube player pages.
 - **Downloads:** `yt-dlp` and FFmpeg are staged by the platform build scripts and bundled with the application.
@@ -1556,7 +1556,7 @@ The platform-specific runtime differs; test each supported engine and package ra
 
 # 68. Acceptance Criteria
 
-These are product acceptance goals, not a declaration that the current 1.0.1 build has completed every item. Treat each item as incomplete until verified by implementation and release testing.
+These are product acceptance goals, not a declaration that the current 1.0.2 build has completed every item. Treat each item as incomplete until verified by implementation and release testing.
 
 - YouTube works normally.
 - Google login works.

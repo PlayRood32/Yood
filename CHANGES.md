@@ -1,5 +1,12 @@
 # 📝 Changelog
 
+## 🛠️ v1.0.2 — Subtitle sidecar download
+
+- Surface YouTube captions as a downloadable file instead of embedding them:
+  dropped yt-dlp `--embed-subs` from the Rust video arg builder on both Linux
+  and Windows so caption files are written alongside the media via
+  `--write-subs`/`--write-auto-subs` and reached by the sidecar extractor.
+
 ## 🛠️ v1.0.1 — Sign-in, downloads and YouTube controls
 
 - Keep Yood bootstrap overlays and page integration scripts limited to

@@ -2151,6 +2151,81 @@
     document.body.appendChild(pill);
     wlRefreshUI();
   }
+  // Fullscreen video playback: Yood's floating chrome would overlay the
+  // picture, so hide every non-modal floating element while the player is
+  // in (or theater) fullscreen and restore it on exit. Modal dialogs stay
+  // visible — they are parented to the fullscreen element on purpose.
+  function yoodInstallFullscreenHiding() {
+    try {
+      if (document.getElementById("yood-fullscreen-style")) return;
+      var head = document.head || document.documentElement;
+      if (!head) return;
+      var style = document.createElement("style");
+      style.id = "yood-fullscreen-style";
+      style.textContent =
+        ":root.yood-hud-hidden #yood-nav," +
+        ":root.yood-hud-hidden #yood-later-pill," +
+        ":root.yood-hud-hidden #yood-downloads-toggle," +
+        ":root.yood-hud-hidden [data-yood-main]," +
+        ":root.yood-hud-hidden #yood-later-panel," +
+        ":root.yood-hud-hidden #yood-downloads-panel," +
+        ":root.yood-hud-hidden #yood-dl-toast," +
+        ":root.yood-hud-hidden #yood-later-toast { display: none !important; }";
+      head.appendChild(style);
+
+      var hudHidden = "yood-hud-hidden";
+      var lastNative = false;
+      var lastYoutube = false;
+      var lastApply = 0;
+      function isNativeFullscreen() {
+        return !!(document.fullscreenElement ||
+          document.webkitFullscreenElement ||
+          document.msFullscreenElement ||
+          document.mozFullScreenElement);
+      }
+      function youtubeFullscreenNode() {
+        try {
+          return document.querySelector(
+            "#movie_player.ytp-fullscreen, #movie_player.ytp-theater, " +
+            "ytd-watch-flexy[fullscreen], ytd-watch-flexy[theater], " +
+            ".html5-video-player.ytp-fullscreen");
+        } catch (e) { return null; }
+      }
+      function apply() {
+        var now = Date.now();
+        if (now - lastApply < 60) return;
+        lastApply = now;
+        var native = isNativeFullscreen();
+        var youtube = !!youtubeFullscreenNode();
+        if (native === lastNative && youtube === lastYoutube) return;
+        lastNative = native;
+        lastYoutube = youtube;
+        document.documentElement.classList.toggle(hudHidden, native || youtube);
+      }
+      [
+        "fullscreenchange", "webkitfullscreenchange",
+        "mozfullscreenchange", "msfullscreenchange"
+      ].forEach(function (event) { document.addEventListener(event, apply); });
+      window.addEventListener("resize", apply);
+      var observer = new MutationObserver(function () { apply(); });
+      function watch() {
+        var target = document.querySelector("#movie_player, ytd-watch-flexy");
+        if (target) {
+          observer.observe(target, {
+            attributes: true,
+            attributeFilter: ["class", "fullscreen", "theater"]
+          });
+        }
+      }
+      watch();
+      window.addEventListener("yt-navigate-finish", function () {
+        observer.disconnect();
+        watch();
+        apply();
+      });
+      apply();
+    } catch (e) { /* never break the page */ }
+  }
   // ---- Downloads side panel (live progress, inside the page) ----
   // The extension has no Tauri bridge, so progress comes from the
   // backend's localhost feed (port published per launch in defaults.json).
@@ -2840,6 +2915,7 @@
   });
   retitle();
   installPlayerAdSkip();
+  yoodInstallFullscreenHiding();
   if (document.head) {
     new MutationObserver(retitle).observe(
       document.head.querySelector("title") || document.head,

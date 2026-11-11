@@ -543,6 +543,22 @@ impl DownloadManager {
                 if let Err(error) = move_media(&source, &target, settings.overwrite_existing) {
                     return RunOutcome::Failed(error);
                 }
+                // Subtitle sidecars written by yt-dlp live alongside the media
+                // in the temp dir. We deliberately do not embed captions into the
+                // media stream (`--embed-subs` is omitted) so every requested
+                // caption arrives as an extractable file next to the final file,
+                // never silently discarded.
+                if wants_subtitles(&item.request, &settings) {
+                    if let Err(error) = move_subtitle_sidecars(
+                        &temporary_root,
+                        &target,
+                        settings.overwrite_existing,
+                    ) {
+                        logging::warn(format!(
+                            "failed to keep subtitle files for {target:?}: {error}"
+                        ));
+                    }
+                }
                 if settings.cleanup_temp_files {
                     let _ = fs::remove_dir_all(&temporary_root);
                 }
@@ -1273,6 +1289,18 @@ fn is_valid_subtitle_language(value: &str) -> bool {
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+fn subtitle_sidecar_extensions() -> [&'static str; 6] {
+    // Sidecar formats yt-dlp may write next to the media file. Captions are
+    // always fetched as sidecars (`--embed-subs` is intentionally omitted), so
+    // these sidecars survive and are kept as companions so captions reach the
+    // user instead of being silently discarded with the stream.
+    ["vtt", "srt", "ass", "ttml", "sbv", "lrc"]
+}
+
+fn wants_subtitles(request: &DownloadRequest, settings: &Settings) -> bool {
+    request.subtitles || settings.download_subtitles
+}
+
 fn build_download_args(
     request: &DownloadRequest,
     temp: &Path,
@@ -1298,11 +1326,34 @@ fn build_download_args(
                 "--merge-output-format".into(),
                 request.container.clone(),
             ]);
-            if request.subtitles || settings.download_subtitles {
+            if wants_subtitles(request, settings) {
                 // Per-download language wins; otherwise the configured
                 // default. Auto-generated subtitles are included too, so the
                 // chosen language is available even when the uploader only
                 // provided auto captions (YouTube auto-translates).
+                let language = request
+                    .subtitle_language
+                    .clone()
+                    .filter(|value| is_valid_subtitle_language(value))
+                    .unwrap_or_else(|| settings.subtitle_language.clone());
+                // yt-dlp's `--embed-subs` injects captions into the main media
+                // stream instead of writing extractable sidecar files; since Yood
+                // surfaces captions as a downloadable file, omit it so
+                // `--write-subs`/`--write-auto-subs` produce those files.
+                args.extend([
+                    "--write-subs".into(),
+                    "--write-auto-subs".into(),
+                    "--sub-langs".into(),
+                    language,
+                ]);
+            }
+        }
+        DownloadMode::Audio | DownloadMode::Songs => {
+            // Audio downloads also fetch subtitles when requested so the
+            // caption sidecars (and metadata) reach the output folder. The
+            // audio stream itself has no subtitle track to embed, so only
+            // `--write-subs` (no `--embed-subs`) is added.
+            if wants_subtitles(request, settings) {
                 let language = request
                     .subtitle_language
                     .clone()
@@ -1313,11 +1364,8 @@ fn build_download_args(
                     "--write-auto-subs".into(),
                     "--sub-langs".into(),
                     language,
-                    "--embed-subs".into(),
                 ]);
             }
-        }
-        DownloadMode::Audio | DownloadMode::Songs => {
             args.extend([
                 "-f".into(),
                 "bestaudio/best".into(),
@@ -1682,6 +1730,70 @@ fn locate_media(directory: &Path) -> Option<PathBuf> {
     candidates.pop().map(|(_, path)| path)
 }
 
+fn move_subtitle_sidecars(directory: &Path, target: &Path, overwrite: bool) -> AppResult<()> {
+    let Some(target_name) = target.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    // The media's own stem (without an extension). yt-dlp writes subtitle
+    // sidecars as `<media-stem>.<lang>.<vtt|srt|...>`.
+    let Some((stem, _)) = target_name.rsplit_once('.') else {
+        return Ok(());
+    };
+    if stem.is_empty() {
+        return Ok(());
+    }
+    let parent = match target.parent() {
+        Some(parent) => parent,
+        None => return Ok(()),
+    };
+    for entry in fs::read_dir(directory).map_err(|error| {
+        AppError::Storage(format!("cannot read temp dir for subtitles: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            AppError::Storage(format!("cannot read temp dir entry: {error}"))
+        })?;
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !subtitle_sidecar_extensions().contains(&extension) {
+            continue;
+        }
+        // Match exactly the sidecars for this download: they start with the
+        // `--output` template stem `yood-source` and carry a language tag
+        // (e.g. `yood-source.en.vtt`). Anything else (loose files from other
+        // downloads in a shared temp folder) is left alone.
+        if !name.starts_with("yood-source.") {
+            continue;
+        }
+        let Some((source_stem, _)) = name.rsplit_once('.') else {
+            continue;
+        };
+        // `yood-source.en.vtt` -> language `en`.
+        let language = source_stem
+            .strip_prefix("yood-source.")
+            .unwrap_or("und");
+        let sidecar = parent.join(format!("{stem}.{language}.{extension}"));
+        // Keep going even if a sidecar is rejected (e.g. an existing file with
+        // overwrite disabled) so the remaining languages are not lost.
+        if let Err(error) = move_media(&path, &sidecar, overwrite) {
+            logging::debug(format!(
+                "skipped subtitle {name:?} ({error}); moving the rest"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn unique_target(directory: &Path, stem: &str, extension: &str, overwrite: bool) -> PathBuf {
     let base = directory.join(format!("{stem}.{extension}"));
     if overwrite || !base.exists() {
@@ -1894,6 +2006,62 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&control_selector).is_err());
+    }
+
+    #[test]
+    fn moves_only_matching_subtitle_sidecars_next_to_target() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yood-subs-{}-{nonce}", Uuid::new_v4()));
+        let temp = root.join("temp");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(temp.join("yood-source.mp4"), b"media").unwrap();
+        std::fs::write(temp.join("yood-source.en.vtt"), b"subs-en").unwrap();
+        std::fs::write(temp.join("yood-source.he.srt"), b"subs-he").unwrap();
+        // Non-matching files must be ignored (unrelated download or thumbs).
+        std::fs::write(temp.join("yood-source.fr.json"), b"{}").unwrap();
+        std::fs::write(temp.join("other.en.vtt"), b"ignore").unwrap();
+
+        let target = dest.join("My Video - Channel.mp4");
+        std::fs::write(&target, b"media-copy").unwrap();
+        move_subtitle_sidecars(&temp, &target, true).unwrap();
+
+        assert!(dest.join("My Video - Channel.en.vtt").exists());
+        assert!(dest.join("My Video - Channel.he.srt").exists());
+        assert!(!dest.join("My Video - Channel.und.en.vtt").exists());
+
+        // Overwrite=false must not clobber an existing sidecar; the conflict is
+        // skipped while the remaining sidecars are still moved.
+        let existing = dest.join("My Video - Channel.fr.vtt");
+        std::fs::write(&existing, b"keep").unwrap();
+        std::fs::write(temp.join("yood-source.fr.vtt"), b"new").unwrap();
+        let overwrite_off = move_subtitle_sidecars(&temp, &target, false);
+        assert!(overwrite_off.is_ok());
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
+        assert!(dest.join("My Video - Channel.en.vtt").exists());
+        assert!(dest.join("My Video - Channel.he.srt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audio_mode_with_subtitles_writes_subs_but_not_embed() {
+        let mut settings = Settings::default();
+        settings.download_subtitles = true;
+        let audio = DownloadRequest {
+            url: "https://www.youtube.com/watch?v=abc".into(),
+            mode: DownloadMode::Audio,
+            ..Default::default()
+        };
+        let args = build_download_args(&audio, Path::new("/tmp/yood"), &settings).unwrap();
+        assert!(args.iter().any(|a| a == "--write-subs"));
+        assert!(args.iter().any(|a| a == "--write-auto-subs"));
+        assert!(!args.iter().any(|a| a == "--embed-subs"));
     }
 }
 

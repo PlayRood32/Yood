@@ -13,7 +13,7 @@ and an optional local player.
 
 </div>
 
-**Current version: 1.0.1**
+**Current version: 1.0.2**
 
 Yood is built with Rust, Tauri, and TypeScript. It uses the official YouTube
 website and account rather than recreating YouTube or requiring a separate
