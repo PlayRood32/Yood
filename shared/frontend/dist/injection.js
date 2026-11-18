@@ -887,31 +887,31 @@ function showDownloadDialog(url, context) {
     card.className = "yood-card";
     card.setAttribute("role", "dialog");
     card.setAttribute("aria-modal", "true");
-    card.innerHTML = `<h2>Download with Yood</h2><div class="yood-muted">${escapeHtml(document.title.replace(/ - YouTube$/, ""))}</div>`;
+    setHTML(card, `<h2>Download with Yood</h2><div class="yood-muted">${escapeHtml(document.title.replace(/ - YouTube$/, ""))}</div>`);
     const modeRow = document.createElement("div");
     modeRow.className = "yood-row";
-    modeRow.innerHTML = `<label for="yood-mode">Mode</label><select id="yood-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select>`;
+    setHTML(modeRow, `<label for="yood-mode">Mode</label><select id="yood-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select>`);
     const qualityRow = document.createElement("div");
     qualityRow.className = "yood-row";
-    qualityRow.innerHTML = `<label for="yood-quality">Quality</label><select id="yood-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option><option value="worst">Smallest available</option></select>`;
+    setHTML(qualityRow, `<label for="yood-quality">Quality</label><select id="yood-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option><option value="worst">Smallest available</option></select>`);
     const containerRow = document.createElement("div");
     containerRow.className = "yood-row";
-    containerRow.innerHTML = `<label for="yood-container">Container</label><select id="yood-container"><option value="mp4">MP4</option><option value="mkv">MKV</option></select>`;
+    setHTML(containerRow, `<label for="yood-container">Container</label><select id="yood-container"><option value="mp4">MP4</option><option value="mkv">MKV</option></select>`);
     const subsModeRow = document.createElement("div");
     subsModeRow.className = "yood-row";
-    subsModeRow.innerHTML = `<label for="yood-subs-mode">Subtitles</label><select id="yood-subs-mode"><option value="none">None</option><option value="video">Download with video</option><option value="only">Subtitles only (no video)</option></select>`;
+    setHTML(subsModeRow, `<label for="yood-subs-mode">Subtitles</label><select id="yood-subs-mode"><option value="none">None</option><option value="video">Download with video</option><option value="only">Subtitles only (no video)</option></select>`);
     const subLangRow = document.createElement("div");
     subLangRow.className = "yood-row";
-    subLangRow.innerHTML = `<label for="yood-sub-lang">Subtitle language</label><select id="yood-sub-lang"></select>`;
+    setHTML(subLangRow, `<label for="yood-sub-lang">Subtitle language</label><select id="yood-sub-lang"></select>`);
     const subFormatRow = document.createElement("div");
     subFormatRow.className = "yood-row";
-    subFormatRow.innerHTML = `<label for="yood-sub-format">Subtitle format</label><select id="yood-sub-format"><option value="">Default (vtt)</option><option value="srt">SRT</option><option value="ass">ASS</option><option value="ttml">TTML</option><option value="lrc">LRC (lyrics)</option></select>`;
+    setHTML(subFormatRow, `<label for="yood-sub-format">Subtitle format</label><select id="yood-sub-format"><option value="">Default (vtt)</option><option value="srt">SRT</option><option value="ass">ASS</option><option value="ttml">TTML</option><option value="lrc">LRC (lyrics)</option></select>`);
     const populateSubtitleLanguages = (videoLanguages, preferred) => {
         const select = subLangRow.querySelector("#yood-sub-lang");
         if (!select)
             return;
         const previous = select.value || preferred;
-        select.innerHTML = "";
+        setHTML(select, "");
         const seen = new Set();
         for (const [code, name] of YOOD_SUBTITLE_LANGS) {
             // "pt-BR" also satisfies "pt", so pick the real caption code when a
@@ -958,7 +958,7 @@ function showDownloadDialog(url, context) {
     subsModeRow.querySelector("select")?.addEventListener("change", syncSubsUI);
     const locationRow = document.createElement("div");
     locationRow.className = "yood-row";
-    locationRow.innerHTML = `<label for="yood-download-folder">Save to</label><input id="yood-download-folder" type="text" placeholder="Loading…"><button id="yood-download-folder-browse" type="button" class="yood-secondary">Browse…</button>`;
+    setHTML(locationRow, `<label for="yood-download-folder">Save to</label><input id="yood-download-folder" type="text" placeholder="Loading…"><button id="yood-download-folder-browse" type="button" class="yood-secondary">Browse…</button>`);
     const browse = locationRow.querySelector("#yood-download-folder-browse");
     browse?.addEventListener("click", async () => {
         browse.disabled = true;
@@ -996,7 +996,7 @@ function showDownloadDialog(url, context) {
         }
     }).catch(() => undefined);
     const advanced = document.createElement("details");
-    advanced.innerHTML = `<summary>Advanced</summary><div class="yood-row"><label for="yood-format">yt-dlp format selector</label><input id="yood-format" type="text" placeholder="optional"></div><div class="yood-row"><label><input id="yood-thumb" type="checkbox"> Embed thumbnail and metadata</label></div>`;
+    setHTML(advanced, `<summary>Advanced</summary><div class="yood-row"><label for="yood-format">yt-dlp format selector</label><input id="yood-format" type="text" placeholder="optional"></div><div class="yood-row"><label><input id="yood-thumb" type="checkbox"> Embed thumbnail and metadata</label></div>`);
     const actions = document.createElement("div");
     actions.className = "yood-actions";
     const cancel = button("Cancel");
@@ -1051,7 +1051,7 @@ async function showPlaylistDialog(url, kind) {
     overlay.className = "yood-overlay";
     const card = document.createElement("section");
     card.className = "yood-card";
-    card.innerHTML = `<h2>${kind === "playlist" ? "Playlist" : "Channel"} download</h2><p class="yood-muted">Loading available videos…</p>`;
+    setHTML(card, `<h2>${kind === "playlist" ? "Playlist" : "Channel"} download</h2><p class="yood-muted">Loading available videos…</p>`);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
     try {
@@ -1060,10 +1060,10 @@ async function showPlaylistDialog(url, kind) {
         try {
             const plTitle = escapeHtml(`${yoodT("playlistTitle")} — ${result.title || (kind === "playlist" ? "Playlist" : "Channel")}`);
             const plSub = escapeHtml(yoodT("playlistConfirm").split("{n}").join(String(entries.length)));
-            card.innerHTML = `<h2>${plTitle}</h2><p class="yood-muted">${plSub}</p>`;
+            setHTML(card, `<h2>${plTitle}</h2><p class="yood-muted">${plSub}</p>`);
         }
         catch {
-            card.innerHTML = `<h2>${escapeHtml(result.title || (kind === "playlist" ? "Playlist" : "Channel"))}</h2>`;
+            setHTML(card, `<h2>${escapeHtml(result.title || (kind === "playlist" ? "Playlist" : "Channel"))}</h2>`);
         }
         const selectActions = document.createElement("div");
         selectActions.className = "yood-actions";
@@ -1073,7 +1073,7 @@ async function showPlaylistDialog(url, kind) {
         entries.forEach((entry) => {
             const row = document.createElement("div");
             row.className = "yood-entry";
-            row.innerHTML = `<input type="checkbox" checked data-yood-entry="${escapeHtml(entry.url)}"><label>${escapeHtml(entry.title || entry.id)}<span class="yood-muted">${escapeHtml(entry.channel || "")}</span></label>`;
+            setHTML(row, `<input type="checkbox" checked data-yood-entry="${escapeHtml(entry.url)}"><label>${escapeHtml(entry.title || entry.id)}<span class="yood-muted">${escapeHtml(entry.channel || "")}</span></label>`);
             list.appendChild(row);
         });
         selectAll.addEventListener("click", () => list.querySelectorAll("input").forEach((input) => input.checked = true));
@@ -1081,7 +1081,7 @@ async function showPlaylistDialog(url, kind) {
         selectActions.append(selectAll, selectNone);
         card.append(selectActions, list);
         const options = document.createElement("div");
-        options.innerHTML = `<h3>Download options</h3><div class="yood-row"><label>Mode</label><select id="yood-list-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select></div><div class="yood-row"><label>Quality</label><select id="yood-list-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option></select></div><div class="yood-row"><label for="yood-list-folder">Save to</label><input id="yood-list-folder" type="text" placeholder="Loading…"><button id="yood-list-folder-browse" type="button" class="yood-secondary">Browse…</button></div><div class="yood-row"><label><input id="yood-list-subs" type="checkbox"> Download subtitles</label></div><div class="yood-row"><label for="yood-list-sub-lang">Subtitle language</label><input id="yood-list-sub-lang" type="text" value="en" placeholder="en"></div>`;
+        setHTML(options, `<h3>Download options</h3><div class="yood-row"><label>Mode</label><select id="yood-list-mode"><option value="video">Video</option><option value="audio">Audio (MP3)</option><option value="songs">Songs (MP3 + metadata)</option></select></div><div class="yood-row"><label>Quality</label><select id="yood-list-quality"><option value="best">Best available</option><option value="1080">1080p or best</option><option value="720">720p or best</option><option value="480">480p or best</option></select></div><div class="yood-row"><label for="yood-list-folder">Save to</label><input id="yood-list-folder" type="text" placeholder="Loading…"><button id="yood-list-folder-browse" type="button" class="yood-secondary">Browse…</button></div><div class="yood-row"><label><input id="yood-list-subs" type="checkbox"> Download subtitles</label></div><div class="yood-row"><label for="yood-list-sub-lang">Subtitle language</label><input id="yood-list-sub-lang" type="text" value="en" placeholder="en"></div>`);
         const browseListFolder = options.querySelector("#yood-list-folder-browse");
         browseListFolder?.addEventListener("click", async () => {
             browseListFolder.disabled = true;
@@ -1142,7 +1142,7 @@ async function showPlaylistDialog(url, kind) {
         card.appendChild(actions);
     }
     catch (error) {
-        card.innerHTML = `<h2>Unable to read ${kind}</h2><p>${escapeHtml(String(error))}</p>`;
+        setHTML(card, `<h2>Unable to read ${kind}</h2><p>${escapeHtml(String(error))}</p>`);
     }
 }
 const WATCH_LATER_KEY = "yood-watch-later";
@@ -1949,7 +1949,7 @@ function ensureDownloadBar() {
     label.className = "yood-bar-label";
     const progress = document.createElement("span");
     progress.className = "yood-bar-progress";
-    progress.innerHTML = "<i style='width:0%'></i>";
+    setHTML(progress, "<i style='width:0%'></i>");
     bar.append(label, progress);
     bar.addEventListener("click", () => showManager());
     document.body.appendChild(bar);
@@ -2039,7 +2039,7 @@ function renderManagerRow(item) {
     const errorNote = item.status === "failed" && item.error
         ? `<div class="yood-muted" style="color:#f28b82;white-space:normal;">${escapeHtml(item.error)}</div>`
         : "";
-    row.innerHTML = `<div style="flex:1"><strong>${safeTitle}</strong><div class="yood-muted">${escapeHtml(item.channel || "")} · ${escapeHtml(item.status)}${item.speed ? ` · ${escapeHtml(item.speed)}` : ""}${item.eta ? ` · ETA ${escapeHtml(item.eta)}` : ""}</div>${errorNote}<div class="yood-progress"><i style="width:${Math.max(0, Math.min(100, item.progress || 0))}%"></i></div></div>`;
+    setHTML(row, `<div style="flex:1"><strong>${safeTitle}</strong><div class="yood-muted">${escapeHtml(item.channel || "")} · ${escapeHtml(item.status)}${item.speed ? ` · ${escapeHtml(item.speed)}` : ""}${item.eta ? ` · ETA ${escapeHtml(item.eta)}` : ""}</div>${errorNote}<div class="yood-progress"><i style="width:${Math.max(0, Math.min(100, item.progress || 0))}%"></i></div></div>`);
     if (["downloading", "paused", "queued", "interrupted"].includes(item.status)) {
         const action = button(item.status === "paused" ? "Resume" : "Pause");
         action.addEventListener("click", async () => { action.disabled = true; try {
@@ -2102,12 +2102,12 @@ async function showManager() {
     overlay.className = "yood-overlay";
     const card = document.createElement("section");
     card.className = "yood-card";
-    card.innerHTML = "<h2>Yood Downloads</h2><p class='yood-muted'>Loading…</p>";
+    setHTML(card, "<h2>Yood Downloads</h2><p class='yood-muted'>Loading…</p>");
     overlay.appendChild(card);
     document.body.appendChild(overlay);
     try {
         const items = await invoke("list_downloads");
-        card.innerHTML = "<h2>Yood Downloads</h2>";
+        setHTML(card, "<h2>Yood Downloads</h2>");
         const sections = {};
         for (const state of ["active", "queued", "completed", "failed"]) {
             const heading = document.createElement("h3");
@@ -2173,7 +2173,7 @@ async function showManager() {
         closeManagerLive = () => { void unlistenPromise.then((unlisten) => unlisten()); };
     }
     catch (error) {
-        card.innerHTML = `<h2>Downloads unavailable</h2><p>${escapeHtml(String(error))}</p>`;
+        setHTML(card, `<h2>Downloads unavailable</h2><p>${escapeHtml(String(error))}</p>`);
     }
 }
 function formatTimestamp(value) {
@@ -2188,7 +2188,7 @@ async function showSettings() {
     overlay.className = "yood-overlay";
     const card = document.createElement("section");
     card.className = "yood-card";
-    card.innerHTML = "<h2>Yood Settings</h2><p class='yood-muted'>Loading…</p>";
+    setHTML(card, "<h2>Yood Settings</h2><p class='yood-muted'>Loading…</p>");
     overlay.appendChild(card);
     document.body.appendChild(overlay);
     try {
@@ -2197,8 +2197,8 @@ async function showSettings() {
             invoke("get_app_info").catch(() => null),
             invoke("get_account_hints").catch(() => null),
         ]);
-        card.innerHTML = "<h2>Yood Settings</h2>";
-        card.innerHTML += `
+        setHTML(card, "<h2>Yood Settings</h2>");
+        setHTML(card, card.innerHTML + `
       <h3>Appearance</h3>
       <div class="yood-row"><label for="yood-theme">Theme</label><select id="yood-theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
       <h3>Accounts</h3>
@@ -2226,7 +2226,7 @@ async function showSettings() {
       <div class="yood-row"><label>Yood version</label><span class="yood-muted">${appInfo ? escapeHtml(appInfo.version) : "—"}</span></div>
       ${appInfo ? appInfo.binaries.map((binary) => `<div class="yood-row"><label>${escapeHtml(binary.name)}</label><span class="yood-muted">${binary.available ? escapeHtml(binary.version || "installed") + (binary.bundled ? " (bundled)" : " (system)") : "Not available"}</span></div>`).join("") : ""}
       <div class="yood-row"><button id="yood-update-ytdlp" type="button" class="yood-secondary">Update yt-dlp now</button></div>
-    `;
+    `);
         card.querySelector("#yood-theme").value = settings.appearance;
         card.querySelector("#yood-account-label").value = accountHints || "";
         card.querySelector("#yood-tracking").checked = settings.tracking_protection;
@@ -2339,8 +2339,25 @@ async function showSettings() {
         card.appendChild(actions);
     }
     catch (error) {
-        card.innerHTML = `<h2>Settings unavailable</h2><p>${escapeHtml(String(error))}</p>`;
+        setHTML(card, `<h2>Settings unavailable</h2><p>${escapeHtml(String(error))}</p>`);
     }
+}
+let yoodHtmlPolicy = null;
+function trustedHtml(html) {
+    try {
+        const tt = window.trustedTypes;
+        if (tt) {
+            if (!yoodHtmlPolicy) {
+                yoodHtmlPolicy = tt.createPolicy("yood", { createHTML: (value) => value });
+            }
+            return yoodHtmlPolicy.createHTML(html);
+        }
+    }
+    catch { /* Trusted Types unavailable: plain string is fine */ }
+    return html;
+}
+function setHTML(element, html) {
+    element.innerHTML = trustedHtml(html);
 }
 function escapeHtml(value) { const node = document.createElement("span"); node.textContent = value; return node.innerHTML; }
 const AD_RENDERER_SELECTORS = [

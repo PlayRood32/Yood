@@ -154,11 +154,24 @@ function installAuthRecovery(): void {
 
     const overlay = document.createElement("div");
     overlay.id = "yood-boot";
-    overlay.innerHTML = `<div id="yood-boot-card" role="status" aria-live="polite">
-      <div id="yood-boot-title">Yood</div>
-      <div id="yood-boot-message">Connecting to YouTube…</div>
-      <button id="yood-boot-retry" type="button">Retry</button>
-    </div>`;
+    // Trusted Types on YouTube forbids innerHTML string assignment even in
+    // the early boot overlay, so build the card with DOM nodes.
+    const card = document.createElement("div");
+    card.id = "yood-boot-card";
+    card.setAttribute("role", "status");
+    card.setAttribute("aria-live", "polite");
+    const bootTitle = document.createElement("div");
+    bootTitle.id = "yood-boot-title";
+    bootTitle.textContent = "Yood";
+    const bootMessage = document.createElement("div");
+    bootMessage.id = "yood-boot-message";
+    bootMessage.textContent = "Connecting to YouTube…";
+    const retry = document.createElement("button");
+    retry.id = "yood-boot-retry";
+    retry.type = "button";
+    retry.textContent = "Retry";
+    card.append(bootTitle, bootMessage, retry);
+    overlay.appendChild(card);
     documentRoot.appendChild(overlay);
 
     let finished = false;

@@ -6,7 +6,8 @@
   "permissions": [
     "core:default",
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "yood-app-commands"
   ],
   "remote": {
     "urls": ["https://*.youtube.com/*", "https://youtube.com/*"]
