@@ -13,7 +13,7 @@ and an optional local player.
 
 </div>
 
-**Current version: 1.0.2**
+**Current version: 1.0.3**
 
 Yood is built with Rust, Tauri, and TypeScript. It uses the official YouTube
 website and account rather than recreating YouTube or requiring a separate
@@ -38,9 +38,10 @@ media service. The app is designed as a player, not a general-purpose browser.
 
 ### YouTube controls and filtering
 
-- Adds Yood download controls to YouTube watch and Shorts pages.
-- Adds a Watch later action and keyboard shortcuts, including `Alt+L` for the
-  quick link bar.
+- Adds Yood download controls to YouTube watch and Shorts pages, with a large
+  click area around the Watch later control.
+- Keyboard shortcuts: `Alt+L` opens the quick link bar, `Ctrl+J` opens the
+  downloads manager with progress, errors, and file actions.
 - Uses Brave Shields in aggressive mode for YouTube together with Yood's
   network and cosmetic filter rules. WebView mode has a native request-filter
   layer as well.
@@ -52,7 +53,16 @@ to YouTube. No filter can guarantee that every ad or promotion will be removed.
 
 ### Downloads
 
-- Downloads video, audio, and songs with `yt-dlp` and FFmpeg.
+- Downloads video, audio, songs — or **subtitles only** — with `yt-dlp` and
+  FFmpeg.
+- Subtitle picker marks languages that have no manual captions as `name-Auto`
+  and offers VTT (default), SRT, ASS, TTML, and LRC output files.
+- Private videos work by opting in to "Use browser account (cookies)" in the
+  download dialog: the companion extension exports the signed-in YouTube
+  cookies into a local jar that `yt-dlp` reads with `--cookies`.
+- Failed downloads show the underlying reason in the toast and in the manager.
+- The save-folder picker opens above the app window with a localized title, and
+  changing the folder in settings updates the extension immediately.
 - Shows queued and active downloads with progress, speed, ETA, and errors.
 - Supports configurable download concurrency and controls to pause, resume,
   cancel, retry, and remove downloads.
@@ -236,6 +246,8 @@ See the platform-specific guides for more details:
 
 ## 🔗 Usage
 
+- Keyboard: `Alt+L` opens the quick link bar; `Ctrl+J` opens the downloads
+  manager (queue, progress, failures, and completed-file actions).
 - YouTube deep link: `yood://www.youtube.com/watch?v=VIDEO_ID`
 - Download deep link: `yood://download?url=YOUTUBE_URL`
 - Run `yood --self-test` to check configuration, URL policy, filters, and the
@@ -251,6 +263,7 @@ Yood keeps its app data in the current user's local application directories:
 |---|---|---|
 | Brave profile | `~/.local/share/yood/brave-profile` | `%APPDATA%\PlayRood\Yood\data\brave-profile` |
 | Extension | `~/.local/share/yood/yood-extension` | `%APPDATA%\PlayRood\Yood\data\yood-extension` |
+| Cookie jar | `~/.local/share/yood/cookies.txt` | `%APPDATA%\PlayRood\Yood\data\cookies.txt` |
 | Logs | `~/.local/share/yood/logs/yood.log` | `%APPDATA%\PlayRood\Yood\data\logs\yood.log` |
 
 Settings, download locations, and temporary-file behavior can be configured
@@ -267,6 +280,13 @@ from the app. Logs do not contain passwords, cookies, or tokens.
 - **A download button does not queue a download:** update to the latest build.
   The companion extension relays authenticated requests through its service
   worker instead of making local API requests from the YouTube page.
+- **A private video fails as "This video is unavailable":** turn on "Use
+  browser account (cookies)" in the download dialog so Yood uses your
+  signed-in YouTube session. The cookie jar stays local and is refreshed on
+  every cookie-enabled download.
+- **The folder picker's own buttons are in English:** the native Windows
+  picker's buttons follow the system UI language. Yood sets the dialog title
+  in Hebrew or English according to the app's language.
 - **Ads still appear:** check that Yood is using Brave. Brave mode combines
   Shields, Yood's rules, and the companion extension; filtering can vary with
   YouTube changes and is not guaranteed to remove every promotion.

@@ -1,5 +1,20 @@
 # 📝 Changelog
 
+## 🛠️ v1.0.3 — Downloads, subtitles and cookies
+
+- Added `Ctrl+J` to open the downloads manager in both engines, including the
+  real failure reason in toasts and manager rows.
+- Added subtitle-only downloads and a subtitle format picker (VTT/SRT/ASS/TTML/LRC).
+  Languages with manual captions keep their name; the others are labelled `-Auto`.
+- Private videos can be downloaded with browser cookies exported by the companion
+  extension into a local jar (`--cookies`); cookies are opt-in and never logged.
+- Fixed the save-folder flow: settings changes now refresh the extension's
+  `defaults.json`, the dialog prefills from it, and a folder is only sent when
+  the user actually chose one.
+- The folder picker is parented above the app/Brave window and gets a localized
+  title. The Watch later chip has a much larger click area in both engines.
+- Mirrored all backend changes into the Linux tree.
+
 ## 🛠️ v1.0.2 — Subtitle sidecar download
 
 - Surface YouTube captions as a downloadable file instead of embedding them:

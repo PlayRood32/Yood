@@ -180,6 +180,11 @@
         var sel = parts[i].replace(/^\s+|\s+$/g, "");
         if (sel) css += sel + " { display: none !important; }\n";
       }
+      // Watch-later controls: expand the clickable region beyond the
+      // visible chip so a clipped sliver is not the only working hitbox.
+      css += "#yood-later-pill { min-height: 46px !important; }\n";
+      css += "[data-yood-watch-later] { min-width: 112px !important; min-height: 40px !important; }\n";
+      css += '[data-yood-watch-later]::before, #yood-later-pill::before { content: ""; position: absolute; inset: -12px !important; background: transparent; pointer-events: auto; }\n';
       style.textContent = css;
       (document.head || head).appendChild(style);
     } catch (e) { /* never break the page */ }
@@ -262,6 +267,35 @@
   function storeSubLang(value) {
     try { localStorage.setItem("yood-sub-lang", value); } catch (e) { /* private mode */ }
   }
+  function storedUseCookies() {
+    try { return localStorage.getItem("yood-use-cookies") === "1"; }
+    catch (e) { return false; }
+  }
+  function storeUseCookies(value) {
+    try { localStorage.setItem("yood-use-cookies", value ? "1" : "0"); } catch (e) { /* private mode */ }
+  }
+  // Ask the background worker to export the signed-in YouTube cookies into
+  // the backend's local jar. The backend then passes --cookies to yt-dlp so
+  // private videos can be downloaded while Brave is running.
+  function yoodExportCookies(done) {
+    var runtime = (typeof browser !== "undefined" && browser.runtime)
+      ? browser
+      : (typeof chrome !== "undefined" ? chrome : null);
+    if (!runtime || !runtime.runtime || !runtime.runtime.sendMessage) {
+      done(false, "extension runtime unavailable");
+      return;
+    }
+    try {
+      runtime.runtime.sendMessage({ type: "yood-export-cookies" }, function (response) {
+        var error = runtime.runtime.lastError;
+        if (error || !response || !response.ok) {
+          done(false, (response && response.error) || (error && error.message) || "cookie export failed");
+          return;
+        }
+        done(true, response.count || 0);
+      });
+    } catch (e) { done(false, String((e && e.message) || e)); }
+  }
 
   // The app window should read "Yood", not a bare "YouTube". Video pages
   // keep their video title (that is the useful behavior there).
@@ -311,9 +345,14 @@
       if (options.container && options.container !== "mp4") payload.container = options.container;
       if (options.directory) payload.directory = options.directory;
       if (options.format_selector) payload.format_selector = options.format_selector;
-      if (options.subtitles) {
+      if (options.subtitles_only) payload.subtitles_only = true;
+      if (options.subtitle_format) payload.subtitle_format = options.subtitle_format;
+      if (options.subtitles || options.subtitles_only) {
         payload.subtitles = true;
         if (options.subtitle_lang) payload.subtitle_language = options.subtitle_lang;
+      }
+      if (typeof options.cookies === "boolean" ? options.cookies : storedUseCookies()) {
+        payload.cookies = true;
       }
       if (options.embed_thumbnail) payload.embed_thumbnail = true;
     }
@@ -335,6 +374,7 @@
     var requestId = (typeof crypto !== "undefined" && crypto.randomUUID)
       ? crypto.randomUUID()
       : (Date.now().toString(36) + "-" + Math.random().toString(36).slice(2));
+    var send = function () {
     yoodDlEnsureBase(function (base) {
       if (!base) { handToYood(pageUrl, options, requestId); toastOrQuiet(); return; }
       var payload = null;
@@ -373,6 +413,20 @@
           if (!error || !error.noFallback) toastOrQuiet();
         });
     });
+    };
+    // Refresh the cookie jar just before enqueueing whenever cookies are
+    // wanted (also applies to menu/drag enqueues after the user opted in).
+    if (options && typeof options === "object" &&
+        (typeof options.cookies === "boolean" ? options.cookies : storedUseCookies())) {
+      yoodExportCookies(function (ok, detail) {
+        if (!ok) {
+          try { laterToast("YouTube cookies unavailable: " + String(detail).slice(0, 120)); } catch (ignored) { }
+        }
+        send();
+      });
+      return;
+    }
+    send();
   }
 
   // ---- Alt+L floating bar (top center): links, IDs, channels ----
@@ -483,6 +537,14 @@
       var bar = document.getElementById("yood-urlbar");
       if (bar) bar.remove();
       else showUrlBar();
+    }
+    // Ctrl+J opens Yood's own downloads panel (same shortcut as a
+    // browser's downloads page). Capture phase so nothing eats it first.
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey &&
+        (event.code === "KeyJ" || event.key.toLowerCase() === "j")) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toggleDownloadsPanel();
     }
   }, true);
 
@@ -1386,16 +1448,24 @@
         try { input.value = dir; } catch (e) { /* keep placeholder */ }
       }
     };
+    var fallback = function () {
+      try {
+        var remembered = localStorage.getItem("yood-download-folder") || "";
+        if (remembered) fill(remembered);
+      } catch (e) { /* placeholder stays */ }
+    };
+    // defaults.json is rewritten by the backend whenever the settings
+    // folder changes, so it is the source of truth. The remembered folder
+    // is only a fallback for when the backend cannot be reached.
     try {
-      var remembered = null;
-      try { remembered = localStorage.getItem("yood-download-folder") || ""; } catch (e) { remembered = ""; }
-      if (remembered) { input.value = remembered; return; }
       yoodReadDefaults()
         .then(function (data) {
-          if (data && typeof data.download_directory === "string" && data.download_directory) fill(data.download_directory);
+          if (data && typeof data.download_directory === "string" && data.download_directory) {
+            fill(data.download_directory);
+          } else fallback();
         })
-        .catch(function () { /* placeholder stays when unreachable */ });
-    } catch (e) { /* placeholder stays */ }
+        .catch(fallback);
+    } catch (e) { fallback(); }
   }
   function showDownloadDialog(pageUrl) {
     closeDialog();
@@ -1406,10 +1476,14 @@
       quality: "best",
       container: "mp4",
       subtitles: false,
+      subtitles_only: false,
       subtitle_lang: storedSubLang(),
+      subtitle_format: "",
+      cookies: storedUseCookies(),
       format_selector: "",
       embed_thumbnail: false
     };
+    var folderEdited = false;
     var QUALITY_ROWS = [
       ["best", "Best available", "Highest quality video + audio"],
       ["1080", "1080p", "Full HD or best below it"],
@@ -1453,7 +1527,7 @@
       card.querySelectorAll("[data-yood-q]").forEach(function (row) {
         var on = row.getAttribute("data-yood-q") === state.quality && !audioOnly;
         row.setAttribute("aria-selected", on ? "true" : "false");
-        row.style.opacity = audioOnly ? ".45" : "1";
+        row.style.opacity = audioOnly || state.subtitles_only ? ".45" : "1";
         var radio = row.firstChild;
         radio.style.borderColor = on ? YT_BLUE : "#909090";
         radio.innerHTML = on ? '<span style="width:10px;height:10px;border-radius:50%;background:' + YT_BLUE + ';"></span>' : "";
@@ -1467,24 +1541,29 @@
       });
       var contRow = card.querySelector("[data-yood-cont]");
       if (contRow) {
-        contRow.style.opacity = audioOnly ? ".45" : "1";
+        contRow.style.opacity = audioOnly || state.subtitles_only ? ".45" : "1";
         var sel = contRow.querySelector("select");
-        if (sel) { sel.disabled = audioOnly; sel.value = state.container; }
+        if (sel) { sel.disabled = audioOnly || state.subtitles_only; sel.value = state.container; }
       }
-      var subRow = card.querySelector("[data-yood-sub]");
-      if (subRow) {
-        var on = state.subtitles;
-        subRow.setAttribute("aria-selected", on ? "true" : "false");
-        var radio = subRow.firstChild;
+      [["[data-yood-sub]", state.subtitles],
+       ["[data-yood-subonly]", state.subtitles_only],
+       ["[data-yood-cookies]", state.cookies]].forEach(function (pair) {
+        var row = card.querySelector(pair[0]);
+        if (!row) return;
+        var on = pair[1];
+        row.setAttribute("aria-selected", on ? "true" : "false");
+        var radio = row.firstChild;
         radio.style.borderColor = on ? YT_BLUE : "#909090";
         radio.innerHTML = on ? '<span style="width:10px;height:10px;border-radius:50%;background:' + YT_BLUE + ';"></span>' : "";
-      }
-      var langRow = card.querySelector("[data-yood-lang]");
-      if (langRow) {
-        langRow.style.opacity = state.subtitles ? "1" : ".45";
-        var langSel = langRow.querySelector("select");
-        if (langSel) { langSel.disabled = !state.subtitles; langSel.value = state.subtitle_lang; }
-      }
+      });
+      var subsWanted = state.subtitles || state.subtitles_only;
+      ["[data-yood-lang]", "[data-yood-subfmt]"].forEach(function (selector) {
+        var row = card.querySelector(selector);
+        if (!row) return;
+        row.style.opacity = subsWanted ? "1" : ".45";
+        var sel = row.querySelector("select");
+        if (sel) sel.disabled = !subsWanted;
+      });
     }
 
     card.appendChild(ytSectionHeader("Format"));
@@ -1539,6 +1618,7 @@
     folderInput.spellcheck = false;
     folderInput.style.cssText = "flex:1;min-width:0;color:" + YT_TEXT + ";background:#303030;border:1px solid #666;border-radius:8px;padding:8px;";
     loadDefaultFolder(folderInput);
+    folderInput.addEventListener("input", function () { folderEdited = true; });
     var browseBtn = document.createElement("button");
     browseBtn.type = "button";
     try { browseBtn.textContent = yoodT("browse"); } catch (e) { browseBtn.textContent = "Browse…"; }
@@ -1546,6 +1626,7 @@
     browseBtn.style.cssText = "flex:none;border:1px solid #666;border-radius:8px;padding:8px 12px;color:" + YT_TEXT + ";background:#303030;font-size:13px;cursor:pointer;white-space:nowrap;";
     browseBtn.addEventListener("click", function () {
       browseBtn.disabled = true;
+      folderEdited = true;
       var prev = "";
       try { prev = browseBtn.textContent; browseBtn.textContent = "…"; } catch (e) { }
       yoodDlPickFolder(function (picked) {
@@ -1567,8 +1648,20 @@
     card.appendChild(ytSectionHeader("Subtitles"));
     var subRow = ytRow("Download subtitles", "Manual captions when available", false, false);
     subRow.setAttribute("data-yood-sub", "true");
-    subRow.addEventListener("click", function () { state.subtitles = !state.subtitles; refresh(); });
+    subRow.addEventListener("click", function () {
+      state.subtitles = !state.subtitles;
+      if (state.subtitles) state.subtitles_only = false;
+      refresh();
+    });
     card.appendChild(subRow);
+    var subOnlyRow = ytRow("Subtitles only", "Caption files only — no video or audio", false, false);
+    subOnlyRow.setAttribute("data-yood-subonly", "true");
+    subOnlyRow.addEventListener("click", function () {
+      state.subtitles_only = !state.subtitles_only;
+      if (state.subtitles_only) state.subtitles = false;
+      refresh();
+    });
+    card.appendChild(subOnlyRow);
     var langRow = document.createElement("div");
     langRow.setAttribute("data-yood-lang", "true");
     langRow.style.cssText = "display:flex;align-items:center;gap:14px;padding:11px 16px;";
@@ -1579,25 +1672,97 @@
     langTitle.textContent = "Language";
     var langSub = document.createElement("div");
     langSub.style.cssText = "font-size:12px;color:" + YT_MUTED + ";margin-top:2px;";
-    langSub.textContent = "Auto-translated when manual captions are missing";
+    langSub.textContent = "-Auto = YouTube-generated captions";
     langLabel.appendChild(langTitle);
     langLabel.appendChild(langSub);
     var langSel = document.createElement("select");
     langSel.style.cssText = "color:" + YT_TEXT + ";background:#303030;border:1px solid #666;border-radius:8px;padding:8px;max-width:55%;";
-    SUBTITLE_LANGS.forEach(function (pair) {
-      var opt = document.createElement("option");
-      opt.value = pair[0];
-      opt.textContent = pair[1];
-      langSel.appendChild(opt);
-    });
-    langSel.value = state.subtitle_lang;
     langSel.addEventListener("change", function () {
       state.subtitle_lang = langSel.value;
       storeSubLang(langSel.value);
     });
+    function fillLanguageOptions(videoLanguages) {
+      var known = {};
+      langSel.textContent = "";
+      SUBTITLE_LANGS.forEach(function (pair) {
+        var available = null;
+        for (var j = 0; j < videoLanguages.length; j++) {
+          if (videoLanguages[j] === pair[0] || videoLanguages[j].indexOf(pair[0] + "-") === 0) {
+            available = videoLanguages[j];
+            break;
+          }
+        }
+        known[pair[0]] = true;
+        if (available) known[available] = true;
+        var opt = document.createElement("option");
+        opt.value = available || pair[0];
+        // Manual captions in this video keep their name; everything else
+        // comes from YouTube's auto-generated captions ("-Auto").
+        opt.textContent = available ? pair[1] : pair[1] + "-Auto";
+        langSel.appendChild(opt);
+      });
+      for (var k = 0; k < videoLanguages.length; k++) {
+        if (known[videoLanguages[k]]) continue;
+        var extra = document.createElement("option");
+        extra.value = videoLanguages[k];
+        extra.textContent = videoLanguages[k];
+        langSel.appendChild(extra);
+      }
+      langSel.value = state.subtitle_lang;
+    }
+    fillLanguageOptions([]);
+    function inspectSubtitleLanguages() {
+      yoodDlEnsureBase(function (base) {
+        if (!base) return;
+        yoodLocalFetch(base + "/inspect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: pageUrl, cookies: !!state.cookies })
+        })
+          .then(function (response) { if (!response.ok) throw 0; return response.json(); })
+          .then(function (data) {
+            var langs = data && Array.isArray(data.subtitle_languages)
+              ? data.subtitle_languages.filter(function (v) { return typeof v === "string"; }) : [];
+            fillLanguageOptions(langs);
+          })
+          .catch(function () { /* keep the auto-labelled defaults */ });
+      });
+    }
+    // Refresh the jar first when opted in, so inspecting a private video
+    // can see its real caption languages too.
+    if (state.cookies) yoodExportCookies(function () { inspectSubtitleLanguages(); });
+    else inspectSubtitleLanguages();
     langRow.appendChild(langLabel);
     langRow.appendChild(langSel);
     card.appendChild(langRow);
+    var subFmtRow = document.createElement("div");
+    subFmtRow.setAttribute("data-yood-subfmt", "true");
+    subFmtRow.style.cssText = "display:flex;align-items:center;gap:14px;padding:11px 16px;";
+    var subFmtLabel = document.createElement("span");
+    subFmtLabel.style.cssText = "flex:1;font-size:14px;";
+    subFmtLabel.textContent = "Subtitle format";
+    var subFmtSel = document.createElement("select");
+    subFmtSel.style.cssText = "color:" + YT_TEXT + ";background:#303030;border:1px solid #666;border-radius:8px;padding:8px;max-width:55%;";
+    [["", "Default (vtt)"], ["srt", "SRT"], ["ass", "ASS"], ["ttml", "TTML"], ["lrc", "LRC (lyrics)"]].forEach(function (pair) {
+      var opt = document.createElement("option");
+      opt.value = pair[0];
+      opt.textContent = pair[1];
+      subFmtSel.appendChild(opt);
+    });
+    subFmtSel.addEventListener("change", function () { state.subtitle_format = subFmtSel.value; });
+    subFmtRow.appendChild(subFmtLabel);
+    subFmtRow.appendChild(subFmtSel);
+    card.appendChild(subFmtRow);
+    var cookiesRow = ytRow("Use browser account (cookies)", "Needed for private videos", !!state.cookies, false);
+    cookiesRow.setAttribute("data-yood-cookies", "true");
+    cookiesRow.addEventListener("click", function () {
+      state.cookies = !state.cookies;
+      storeUseCookies(state.cookies);
+      refresh();
+      if (state.cookies) yoodExportCookies(function () { inspectSubtitleLanguages(); });
+      else inspectSubtitleLanguages();
+    });
+    card.appendChild(cookiesRow);
 
     var advanced = document.createElement("details");
     advanced.style.cssText = "margin:4px 16px 0;";
@@ -1639,18 +1804,22 @@
       try {
         var folder = "";
         try { folder = folderInput.value.trim(); } catch (e) { folder = ""; }
-        if (folder) {
+        if (folder && folderEdited) {
           try { localStorage.setItem("yood-download-folder", folder); } catch (e) { /* private mode */ }
         }
+        var wantSubs = state.subtitles || state.subtitles_only;
         yoodSendDownload(pageUrl, {
           mode: state.mode,
           quality: state.quality,
           container: state.container,
           format_selector: state.format_selector || undefined,
-          subtitles: state.subtitles,
-          subtitle_lang: state.subtitles ? state.subtitle_lang : undefined,
+          subtitles: wantSubs,
+          subtitles_only: state.subtitles_only,
+          subtitle_lang: wantSubs ? state.subtitle_lang : undefined,
+          subtitle_format: wantSubs ? state.subtitle_format : undefined,
+          cookies: state.cookies,
           embed_thumbnail: state.embed_thumbnail || state.mode === "songs",
-          directory: folder || undefined
+          directory: (folderEdited && folder) ? folder : undefined
         });
       } finally {
         closeDialog();
@@ -1928,7 +2097,7 @@
     chip.style.cssText = (saved
       ? "border:0;background:#168aca;color:#fff;"
       : "border:1px solid #5f5f5f;background:#1f1f1f;color:#e8e8e8;") +
-      "border-radius:18px;padding:8px 14px;margin:4px;font:500 14px Roboto,Arial,sans-serif;cursor:pointer;";
+      "border-radius:18px;padding:10px 16px;min-width:112px;min-height:40px;box-sizing:border-box;position:relative;margin:4px;font:500 14px Roboto,Arial,sans-serif;cursor:pointer;";
   }
   function wlRefreshChip(chip) {
     var saved = !!wlFind(chip.getAttribute(MARK_LATER));
@@ -2174,55 +2343,50 @@
       head.appendChild(style);
 
       var hudHidden = "yood-hud-hidden";
-      var lastNative = false;
-      var lastYoutube = false;
-      var lastApply = 0;
+      var applyScheduled = false;
       function isNativeFullscreen() {
         return !!(document.fullscreenElement ||
           document.webkitFullscreenElement ||
           document.msFullscreenElement ||
           document.mozFullScreenElement);
       }
-      function youtubeFullscreenNode() {
-        try {
-          return document.querySelector(
-            "#movie_player.ytp-fullscreen, #movie_player.ytp-theater, " +
-            "ytd-watch-flexy[fullscreen], ytd-watch-flexy[theater], " +
-            ".html5-video-player.ytp-fullscreen");
-        } catch (e) { return null; }
+      function isYoutubeFullscreen() {
+        return !!document.querySelector(
+          "#movie_player.ytp-fullscreen, .html5-video-player.ytp-fullscreen, ytd-watch-flexy[fullscreen]");
       }
       function apply() {
-        var now = Date.now();
-        if (now - lastApply < 60) return;
-        lastApply = now;
-        var native = isNativeFullscreen();
-        var youtube = !!youtubeFullscreenNode();
-        if (native === lastNative && youtube === lastYoutube) return;
-        lastNative = native;
-        lastYoutube = youtube;
-        document.documentElement.classList.toggle(hudHidden, native || youtube);
+        if (applyScheduled) return;
+        applyScheduled = true;
+        window.requestAnimationFrame(function () {
+          applyScheduled = false;
+          document.documentElement.classList.toggle(
+            hudHidden,
+            isNativeFullscreen() || isYoutubeFullscreen());
+        });
       }
       [
         "fullscreenchange", "webkitfullscreenchange",
         "mozfullscreenchange", "msfullscreenchange"
       ].forEach(function (event) { document.addEventListener(event, apply); });
       window.addEventListener("resize", apply);
-      var observer = new MutationObserver(function () { apply(); });
+      var observer = new MutationObserver(apply);
       function watch() {
-        var target = document.querySelector("#movie_player, ytd-watch-flexy");
-        if (target) {
-          observer.observe(target, {
+        observer.disconnect();
+        var targets = document.querySelectorAll("#movie_player, ytd-watch-flexy");
+        for (var i = 0; i < targets.length; i++) {
+          observer.observe(targets[i], {
             attributes: true,
-            attributeFilter: ["class", "fullscreen", "theater"]
+            attributeFilter: ["class", "fullscreen"]
           });
         }
-      }
-      watch();
-      window.addEventListener("yt-navigate-finish", function () {
-        observer.disconnect();
-        watch();
         apply();
-      });
+      }
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", watch, { once: true });
+      } else {
+        watch();
+      }
+      window.addEventListener("yt-navigate-finish", watch);
       apply();
     } catch (e) { /* never break the page */ }
   }
@@ -2233,12 +2397,14 @@
   // (authenticated POST /pick-folder opens the OS dialog; the extension page itself has
   // no way to show one). Resolves with the chosen path or null.
   function yoodDlPickFolder(done) {
+    var lang = (navigator.language || "en").toLowerCase();
+    var title = lang.indexOf("he") === 0 || lang.indexOf("iw") === 0 ? "בחר תיקיית שמירה" : "Choose save folder";
     yoodDlEnsureBase(function (base) {
       if (!base) { done(null); return; }
       yoodLocalFetch(base + "/pick-folder", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}"
+        body: JSON.stringify({ title: title })
       })
         .then(function (response) { if (!response.ok) throw 0; return response.json(); })
         .then(function (data) {
@@ -2255,7 +2421,7 @@
     try { parsed = new URL(url); }
     catch (e) { return Promise.reject(new Error("invalid Yood local API URL")); }
     if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" ||
-        !["/downloads", "/enqueue", "/pick-folder"].includes(parsed.pathname)) {
+        !["/downloads", "/enqueue", "/pick-folder", "/inspect"].includes(parsed.pathname)) {
       return Promise.reject(new Error("unsupported Yood local API URL"));
     }
     var runtime = (typeof browser !== "undefined" && browser.runtime)
@@ -2352,7 +2518,11 @@
         Number.isFinite(completedAt) && completedAt >= yoodDlStartedAt - 2000;
       if (YOOD_DL_ACTIVE_STATUSES.indexOf(prev) === -1 && !completedSincePageLoad) continue;
       var title = (typeof item.title === "string" && item.title.trim()) ? item.title : "";
-      yoodDlToast(status === "completed", (status === "completed" ? yoodT("downloadDone") : yoodT("downloadFailed")) + (title ? ": " + title : ""));
+      // Failed metadata inspection leaves the title as "Queued download";
+      // show the real backend error so the toast explains WHY it failed.
+      var reason = (status === "failed" && typeof item.error === "string" && item.error.trim())
+        ? " — " + item.error.trim().slice(0, 160) : "";
+      yoodDlToast(status === "completed", (status === "completed" ? yoodT("downloadDone") : yoodT("downloadFailed")) + (title ? ": " + title : "") + reason);
     }
   }
   function yoodDlSchedule(delay) {

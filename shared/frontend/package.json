@@ -1,7 +1,7 @@
 {
   "name": "yood-frontend",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "scripts": {
     "build": "tsc --project tsconfig.json && node -e \"for (const f of ['index.html','player.html','downloads.html']) require('fs').copyFileSync(f, require('path').join('dist', f))\""
   },

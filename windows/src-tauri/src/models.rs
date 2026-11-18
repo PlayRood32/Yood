@@ -128,6 +128,15 @@ pub struct DownloadRequest {
     pub audio_quality: Option<String>,
     pub subtitles: bool,
     pub subtitle_language: Option<String>,
+    /// Fetch only the subtitle files (no audio/video stream).
+    #[serde(default)]
+    pub subtitles_only: bool,
+    /// yt-dlp `--sub-format` preference (e.g. "srt"); None keeps yt-dlp's default.
+    #[serde(default)]
+    pub subtitle_format: Option<String>,
+    /// Send this browser session's YouTube cookies so private videos work.
+    #[serde(default)]
+    pub cookies: bool,
     pub embed_thumbnail: bool,
     pub context: Option<String>,
     pub directory: Option<PathBuf>,
@@ -147,6 +156,9 @@ impl Default for DownloadRequest {
             audio_quality: None,
             subtitles: false,
             subtitle_language: None,
+            subtitles_only: false,
+            subtitle_format: None,
+            cookies: false,
             embed_thumbnail: false,
             context: None,
             directory: None,
@@ -204,6 +216,10 @@ pub struct InspectResult {
     pub thumbnail: Option<String>,
     pub size_bytes: Option<u64>,
     pub entries: Vec<VideoEntry>,
+    /// Manual (uploader-provided) subtitle language codes for this video.
+    /// Empty when the video has none; auto-generated captions are not listed.
+    #[serde(default)]
+    pub subtitle_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

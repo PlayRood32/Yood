@@ -36,7 +36,7 @@ use crate::{
 const MAX_HISTORY: usize = 1000;
 const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCAL_HEADER_BYTES: usize = 16 * 1024;
-const MAX_LOCAL_BODY_BYTES: usize = 32 * 1024;
+const MAX_LOCAL_BODY_BYTES: usize = 512 * 1024;
 const LOCAL_TOKEN_HEADER: &str = "x-yood-token";
 const MAX_PROCESS_LINE_BYTES: usize = 64 * 1024;
 const MAX_PROCESS_STDERR_BYTES: usize = 1024 * 1024;
@@ -278,17 +278,18 @@ impl DownloadManager {
         let _ = self.save();
     }
 
-    pub async fn inspect(&self, raw_url: &str) -> AppResult<InspectResult> {
+    pub async fn inspect(&self, raw_url: &str, cookies: bool) -> AppResult<InspectResult> {
         let url = validate_youtube_url(raw_url)?;
         let (yt_dlp, _) = self.resolver.resolve("yt-dlp")?;
-        let args = vec![
+        let mut args = vec![
             "--ignore-config".into(),
             "--no-warnings".into(),
             "--dump-single-json".into(),
             "--skip-download".into(),
             "--flat-playlist".into(),
-            url.to_string(),
         ];
+        args.extend(cookies_args(cookies)?);
+        args.push(url.to_string());
         let command = process::command(&yt_dlp, &args)?;
         let (code, stdout, stderr) = process::capture(command, Duration::from_secs(45)).await?;
         if code != 0 {
@@ -441,7 +442,7 @@ impl DownloadManager {
         if control.load(Ordering::SeqCst) {
             return RunOutcome::Cancelled;
         }
-        let metadata = match self.inspect(&item.request.url).await {
+        let metadata = match self.inspect(&item.request.url, item.request.cookies).await {
             Ok(value) => value,
             Err(error) => return RunOutcome::Failed(error),
         };
@@ -522,6 +523,32 @@ impl DownloadManager {
             ProcessResult::Cancelled => RunOutcome::Cancelled,
             ProcessResult::Failed(error) => RunOutcome::Failed(error),
             ProcessResult::Completed => {
+                if item.request.subtitles_only {
+                    let stem = sanitize_filename(
+                        &format!("{} - {}", channel, title),
+                        "yood-download",
+                        180,
+                    );
+                    let moved = match move_all_subtitle_sidecars(
+                        &temporary_root,
+                        &destination,
+                        &stem,
+                        settings.overwrite_existing,
+                    ) {
+                        Ok(moved) => moved,
+                        Err(error) => return RunOutcome::Failed(error),
+                    };
+                    let Some(primary) = moved.into_iter().next() else {
+                        return RunOutcome::Failed(AppError::Process(
+                            "yt-dlp completed but produced no subtitles for the selected language"
+                                .into(),
+                        ));
+                    };
+                    if settings.cleanup_temp_files {
+                        let _ = fs::remove_dir_all(&temporary_root);
+                    }
+                    return RunOutcome::Completed(primary);
+                }
                 let source = match locate_media(&temporary_root) {
                     Some(path) => path,
                     None => {
@@ -1068,26 +1095,79 @@ fn handle_progress_client(
         };
         outcome
     } else if request.method.as_deref() == Some("POST")
+        && request.path.as_deref() == Some("/inspect")
+    {
+        let parsed = request
+            .body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok());
+        let url = parsed.as_ref().and_then(|value| value.get("url")).and_then(|value| value.as_str());
+        let cookies = parsed
+            .as_ref()
+            .and_then(|value| value.get("cookies"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let outcome = match url {
+            Some(url) => match tauri::async_runtime::block_on(manager.inspect(url, cookies)) {
+                Ok(result) => match serde_json::to_string(&result) {
+                    Ok(body) => ("200 OK", body),
+                    Err(_) => ("500 Internal Server Error", r#"{"ok":false}"#.into()),
+                },
+                Err(error) => (
+                    "200 OK",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": error.to_string().chars().take(512).collect::<String>(),
+                    })
+                    .to_string(),
+                ),
+            },
+            _ => ("400 Bad Request", r#"{"ok":false,"error":"invalid request"}"#.into()),
+        };
+        outcome
+    } else if request.method.as_deref() == Some("POST")
+        && request.path.as_deref() == Some("/cookies")
+    {
+        let outcome = match request.body.as_deref() {
+            Some(body) => match crate::browser::write_cookie_jar(body) {
+                Ok(count) => (
+                    "200 OK",
+                    serde_json::json!({ "ok": true, "count": count }).to_string(),
+                ),
+                Err(error) => (
+                    "200 OK",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": error.to_string().chars().take(512).collect::<String>(),
+                    })
+                    .to_string(),
+                ),
+            },
+            None => ("400 Bad Request", r#"{"ok":false,"error":"invalid request"}"#.into()),
+        };
+        outcome
+    } else if request.method.as_deref() == Some("POST")
         && request.path.as_deref() == Some("/pick-folder")
     {
         logging::info("folder picker requested from extension");
+        let title = request
+            .body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .and_then(|value| {
+                value.get("title").and_then(|title| title.as_str()).map(str::to_string)
+            });
         let folder = manager
             .app_handle
             .lock()
             .ok()
             .and_then(|handle| handle.clone())
             .and_then(|handle| {
-                use tauri_plugin_dialog::DialogExt;
-                handle
-                    .dialog()
-                    .file()
-                    .blocking_pick_folder()
-                    .and_then(|path| path.into_path().ok())
-                    .and_then(|path| {
-                        crate::security::ensure_safe_output_dir(&path)
-                            .ok()
-                            .map(|_| path.to_string_lossy().into_owned())
-                    })
+                crate::commands::pick_folder_dialog(&handle, title.as_deref()).and_then(|path| {
+                    crate::security::ensure_safe_output_dir(&path)
+                        .ok()
+                        .map(|_| path.to_string_lossy().into_owned())
+                })
             });
         ("200 OK", pick_folder_body(folder))
     } else {
@@ -1249,6 +1329,14 @@ fn validate_request_fields(request: &DownloadRequest) -> AppResult<()> {
             return Err(AppError::InvalidInput("invalid subtitle language".into()));
         }
     }
+    if let Some(format) = &request.subtitle_format {
+        if !is_valid_subtitle_format(format) {
+            return Err(AppError::InvalidInput("invalid subtitle format".into()));
+        }
+    }
+    if request.cookies {
+        cookies_args(true)?;
+    }
     if let Some(request_id) = &request.request_id {
         if request_id.is_empty()
             || request_id.len() > 128
@@ -1301,12 +1389,67 @@ fn wants_subtitles(request: &DownloadRequest, settings: &Settings) -> bool {
     request.subtitles || settings.download_subtitles
 }
 
+fn cookies_args(enabled: bool) -> AppResult<Vec<String>> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let path = crate::browser::cookies_file_path().ok_or_else(|| {
+        AppError::Internal("data directory unavailable for cookie jar".into())
+    })?;
+    if !path.is_file() {
+        return Err(AppError::InvalidInput(
+            "browser cookies are not available yet — open YouTube in Brave with the Yood extension, then retry".into(),
+        ));
+    }
+    Ok(vec![
+        "--cookies".into(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
+fn is_valid_subtitle_format(value: &str) -> bool {
+    matches!(
+        value,
+        "vtt" | "srt" | "ass" | "lrc" | "ttml" | "sbv" | "srv1" | "srv2" | "srv3" | "json3"
+            | "dfxp"
+    )
+}
+
+fn subtitle_format_arg(request: &DownloadRequest) -> Vec<String> {
+    match request
+        .subtitle_format
+        .as_deref()
+        .filter(|value| is_valid_subtitle_format(value))
+    {
+        Some(format) => vec!["--sub-format".into(), format.into()],
+        None => Vec::new(),
+    }
+}
+
 fn build_download_args(
     request: &DownloadRequest,
     temp: &Path,
     settings: &Settings,
 ) -> AppResult<Vec<String>> {
     let mut args = vec!["--ignore-config".into(), "--no-playlist".into(), "--newline".into(), "--progress".into(), "--progress-template".into(), "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s".into(), "--retries".into(), "3".into(), "--fragment-retries".into(), "3".into(), "--socket-timeout".into(), "30".into(), "--continue".into(), "--windows-filenames".into(), "--paths".into(), temp.to_string_lossy().into_owned(), "--output".into(), "yood-source.%(ext)s".into()];
+    args.extend(cookies_args(request.cookies)?);
+    if request.subtitles_only {
+        let language = request
+            .subtitle_language
+            .clone()
+            .filter(|value| is_valid_subtitle_language(value))
+            .unwrap_or_else(|| settings.subtitle_language.clone());
+        args.extend([
+            "--skip-download".into(),
+            "--write-subs".into(),
+            "--write-auto-subs".into(),
+            "--sub-langs".into(),
+            language,
+        ]);
+        args.extend(subtitle_format_arg(request));
+        args.push(request.url.clone());
+        return Ok(args);
+    }
     match request.mode {
         DownloadMode::Video => {
             let selector =
@@ -1346,6 +1489,7 @@ fn build_download_args(
                     "--sub-langs".into(),
                     language,
                 ]);
+                args.extend(subtitle_format_arg(request));
             }
         }
         DownloadMode::Audio | DownloadMode::Songs => {
@@ -1365,6 +1509,7 @@ fn build_download_args(
                     "--sub-langs".into(),
                     language,
                 ]);
+                args.extend(subtitle_format_arg(request));
             }
             args.extend([
                 "-f".into(),
@@ -1597,6 +1742,20 @@ fn parse_inspect(stdout: &str) -> AppResult<InspectResult> {
     } else if let Some(entry) = parse_entry(&value) {
         entries.push(entry);
     }
+    let mut subtitle_languages = Vec::new();
+    if let Some(subtitles) = value.get("subtitles").and_then(Value::as_object) {
+        for (language, formats) in subtitles {
+            let usable = formats
+                .as_array()
+                .map(|list| !list.is_empty())
+                .unwrap_or(false);
+            if usable && is_valid_subtitle_language(language) {
+                subtitle_languages.push(language.clone());
+            }
+        }
+        subtitle_languages.sort();
+        subtitle_languages.truncate(40);
+    }
     Ok(InspectResult {
         title,
         channel,
@@ -1604,6 +1763,7 @@ fn parse_inspect(stdout: &str) -> AppResult<InspectResult> {
         thumbnail,
         size_bytes,
         entries,
+        subtitle_languages,
     })
 }
 
@@ -1792,6 +1952,50 @@ fn move_subtitle_sidecars(directory: &Path, target: &Path, overwrite: bool) -> A
         }
     }
     Ok(())
+}
+
+fn move_all_subtitle_sidecars(
+    directory: &Path,
+    destination: &Path,
+    stem: &str,
+    overwrite: bool,
+) -> AppResult<Vec<PathBuf>> {
+    let mut sidecars: Vec<(String, String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|error| {
+        AppError::Storage(format!("cannot read temp dir for subtitles: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            AppError::Storage(format!("cannot read temp dir entry: {error}"))
+        })?;
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue; };
+        if !meta.is_file() || meta.file_type().is_symlink() { continue; }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else { continue; };
+        if !subtitle_sidecar_extensions().contains(&extension) { continue; }
+        if !name.starts_with("yood-source.") { continue; }
+        let Some((source_stem, _)) = name.rsplit_once('.') else { continue; };
+        let language = source_stem.strip_prefix("yood-source.").unwrap_or("und");
+        sidecars.push((language.to_string(), extension.to_string(), path));
+    }
+    sidecars.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut moved = Vec::with_capacity(sidecars.len());
+    for (language, extension, source) in sidecars {
+        let mut candidate = destination.join(format!("{stem}.{language}.{extension}"));
+        if !overwrite {
+            let mut number = 1;
+            while candidate.exists() && number < 10_000 {
+                candidate = destination.join(format!("{stem} ({number}).{language}.{extension}"));
+                number += 1;
+            }
+            if candidate.exists() {
+                candidate = destination.join(format!("{stem}-{}.{language}.{extension}", Uuid::new_v4()));
+            }
+        }
+        move_media(&source, &candidate, overwrite)?;
+        moved.push(candidate);
+    }
+    Ok(moved)
 }
 
 fn unique_target(directory: &Path, stem: &str, extension: &str, overwrite: bool) -> PathBuf {

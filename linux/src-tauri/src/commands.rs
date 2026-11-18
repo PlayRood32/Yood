@@ -147,6 +147,11 @@ pub fn update_settings(
     );
     crate::logging::set_level(&current.log_level);
     state.downloads.wake_scheduler();
+    crate::browser::write_extension_defaults(
+        &current.download_directory,
+        state.downloads.progress_port(),
+        state.downloads.progress_token().as_deref(),
+    );
     Ok(current.clone())
 }
 
@@ -228,8 +233,12 @@ pub fn remove_download(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn inspect_url(state: State<'_, RuntimeState>, url: String) -> AppResult<InspectResult> {
-    state.downloads.inspect(&url).await
+pub async fn inspect_url(
+    state: State<'_, RuntimeState>,
+    url: String,
+    cookies: Option<bool>,
+) -> AppResult<InspectResult> {
+    state.downloads.inspect(&url, cookies.unwrap_or(false)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -604,15 +613,41 @@ pub fn open_download_folder(
 pub fn pick_folder(
     app: AppHandle,
     state: State<'_, RuntimeState>,
+    title: Option<String>,
     yood_bridge_token: Option<String>,
 ) -> AppResult<Option<String>> {
     require_bridge_token(&state, yood_bridge_token.as_deref())?;
-    let folder = app.dialog().file().blocking_pick_folder();
-    let Some(path) = folder.and_then(|path| path.into_path().ok()) else {
+    let Some(path) = pick_folder_dialog(&app, title.as_deref()) else {
         return Ok(None);
     };
     crate::security::ensure_safe_output_dir(&path)?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Folder picker shared by the Tauri command and the extension's local API.
+/// Parenting keeps the dialog above the visible Yood window.
+pub(crate) fn pick_folder_dialog(app: &AppHandle, title: Option<&str>) -> Option<PathBuf> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(window) = visible_app_window(app) {
+        dialog = dialog.set_parent(&window);
+    }
+    dialog
+        .blocking_pick_folder()
+        .and_then(|path| path.into_path().ok())
+}
+
+fn visible_app_window(app: &AppHandle) -> Option<WebviewWindow> {
+    for label in ["main", "native-player", "downloads"] {
+        if let Some(window) = app.get_webview_window(label) {
+            if window.is_visible().unwrap_or(false) {
+                return Some(window);
+            }
+        }
+    }
+    None
 }
 
 #[tauri::command(rename_all = "snake_case")]

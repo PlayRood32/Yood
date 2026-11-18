@@ -337,6 +337,59 @@ pub fn write_extension_defaults(
     }
 }
 
+/// Cookie jar the companion extension exports from the signed-in browser
+/// profile (Netscape `cookies.txt`, next to defaults.json). yt-dlp reads it
+/// via `--cookies` so private videos work without Yood ever seeing a
+/// password — the extension does the export through `chrome.cookies`.
+pub fn cookies_file_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("com", "PlayRood", "Yood")
+        .map(|project| project.data_dir().join("cookies.txt"))
+}
+
+/// Atomically store the extension's cookie export. Every line is validated
+/// as Netscape format first, so the token-protected local API can never
+/// write arbitrary bytes into the data directory. Returns the cookie count.
+pub fn write_cookie_jar(payload: &str) -> crate::error::AppResult<usize> {
+    use crate::error::AppError;
+    if payload.len() > 512 * 1024 {
+        return Err(AppError::InvalidInput("cookie export is too large".into()));
+    }
+    let mut count = 0usize;
+    for line in payload.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // domain, include_subdomains, path, secure, expires, name, value
+        if line.split('\t').count() != 7 {
+            return Err(AppError::InvalidInput(
+                "invalid cookie export format".into(),
+            ));
+        }
+        count += 1;
+    }
+    let path = cookies_file_path()
+        .ok_or_else(|| AppError::Internal("data directory unavailable for cookie jar".into()))?;
+    let temporary = path.with_extension("txt.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| AppError::Storage(format!("cannot write cookie jar: {error}")))?;
+    file.write_all(payload.as_bytes())
+        .map_err(|error| AppError::Storage(format!("cannot write cookie jar: {error}")))?;
+    let _ = file.sync_all();
+    drop(file);
+    fs::rename(&temporary, &path)
+        .map_err(|error| AppError::Storage(format!("cannot publish cookie jar: {error}")))?;
+    Ok(count)
+}
+
 fn profile_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("com", "PlayRood", "Yood")
         .map(|project| project.data_dir().join("brave-profile"))

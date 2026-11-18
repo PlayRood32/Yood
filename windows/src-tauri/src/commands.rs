@@ -145,6 +145,14 @@ pub fn update_settings(
     );
     crate::logging::set_level(&current.log_level);
     state.downloads.wake_scheduler();
+    // The extension's download dialog reads its save-folder prefill from
+    // defaults.json, which used to be written only at launch — a folder
+    // changed here never reached the extension until the next restart.
+    crate::browser::write_extension_defaults(
+        &current.download_directory,
+        state.downloads.progress_port(),
+        state.downloads.progress_token().as_deref(),
+    );
     Ok(current.clone())
 }
 
@@ -225,8 +233,15 @@ pub fn remove_download(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn inspect_url(state: State<'_, RuntimeState>, url: String) -> AppResult<InspectResult> {
-    state.downloads.inspect(&url).await
+pub async fn inspect_url(
+    state: State<'_, RuntimeState>,
+    url: String,
+    cookies: Option<bool>,
+) -> AppResult<InspectResult> {
+    state
+        .downloads
+        .inspect(&url, cookies.unwrap_or(false))
+        .await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -599,15 +614,92 @@ pub fn open_download_folder(
 pub fn pick_folder(
     app: AppHandle,
     state: State<'_, RuntimeState>,
+    title: Option<String>,
     yood_bridge_token: Option<String>,
 ) -> AppResult<Option<String>> {
     require_bridge_token(&state, yood_bridge_token.as_deref())?;
-    let folder = app.dialog().file().blocking_pick_folder();
-    let Some(path) = folder.and_then(|path| path.into_path().ok()) else {
+    let Some(path) = pick_folder_dialog(&app, title.as_deref()) else {
         return Ok(None);
     };
     crate::security::ensure_safe_output_dir(&path)?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Folder picker shared by the Tauri command and the extension's local API.
+/// The dialog is parented so it opens ABOVE the app: the visible Yood
+/// window in WebView mode, or the foreground window (Brave) when no Tauri
+/// window exists at all. The caller supplies the localized title so the
+/// dialog reads Hebrew when the UI does.
+pub(crate) fn pick_folder_dialog(app: &AppHandle, title: Option<&str>) -> Option<PathBuf> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(window) = visible_app_window(app) {
+        dialog = dialog.set_parent(&window);
+    } else {
+        // Brave mode: no Yood window exists, so own the dialog to whatever
+        // window is currently in front (the Brave window) — that keeps the
+        // picker above the browser instead of behind it.
+        #[cfg(windows)]
+        {
+            if let Some(parent) = foreground_window_parent() {
+                dialog = dialog.set_parent(&parent);
+            }
+        }
+    }
+    dialog
+        .blocking_pick_folder()
+        .and_then(|path| path.into_path().ok())
+}
+
+fn visible_app_window(app: &AppHandle) -> Option<WebviewWindow> {
+    for label in ["main", "native-player", "downloads"] {
+        if let Some(window) = app.get_webview_window(label) {
+            if window.is_visible().unwrap_or(false) {
+                return Some(window);
+            }
+        }
+    }
+    None
+}
+
+/// Raw-handle wrapper for the current foreground window (the Brave window
+/// in Brave mode) so the picker can be owned by it and stay on top.
+#[cfg(windows)]
+pub(crate) struct ForegroundParent {
+    window: raw_window_handle::RawWindowHandle,
+    display: raw_window_handle::RawDisplayHandle,
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for ForegroundParent {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: captured from the live foreground window moments earlier
+        // and only used for the duration of this borrow.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for ForegroundParent {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.display) })
+    }
+}
+
+#[cfg(windows)]
+fn foreground_window_parent() -> Option<ForegroundParent> {
+    let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    let hwnd = std::num::NonZeroIsize::new(hwnd.0 as isize)?;
+    Some(ForegroundParent {
+        window: raw_window_handle::Win32WindowHandle::new(hwnd).into(),
+        display: raw_window_handle::WindowsDisplayHandle::new().into(),
+    })
 }
 
 #[tauri::command(rename_all = "snake_case")]
